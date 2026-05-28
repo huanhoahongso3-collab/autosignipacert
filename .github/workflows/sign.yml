@@ -118,8 +118,8 @@ jobs:
 
           # Extracts the full identity descriptor out of the binary payload
           CERT_SUBJECT=$(openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin "pass:$P12_PASS" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null)
-          # Strips out any existing "CN =" prefixes explicitly to prevent duplicate occurrences
-          CERT_CN=$(echo "$CERT_SUBJECT" | grep -oE "CN\s*=\s*[^,]+" | sed -E 's/CN\s*=\s*//g' | tr -d '"')
+          # Strips out ALL "CN =" / "CN=" prefixes to prevent duplicate CN= occurrences in output
+          CERT_CN=$(echo "$CERT_SUBJECT" | grep -oE "CN\s*=\s*[^,/]+" | sed -E 's/^CN\s*=\s*//g' | sed -E 's/^CN\s*=\s*//g' | tr -d '"' | xargs)
           
           if [ -z "$CERT_CN" ]; then
              CERT_CN="Unknown Developer / Enterprise Certificate"
@@ -187,34 +187,67 @@ jobs:
           echo "final_app_title=$APP_NAME" >> $GITHUB_OUTPUT
           echo "🎯 App Title determined as: $APP_NAME"
 
-          # 4. Safe Icon Extraction Logic
+          # 4. Enhanced Icon Extraction Logic
+          # Strategy 1: Plist primary icon lookup (CFBundleIcons path)
           mkdir -p extracted_assets
           HAS_ICON="false"
-          
-          if /usr/libexec/PlistBuddy -c "Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0" "$INFOPLIST" >/dev/null 2>&1; then
-            PLIST_ICON=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0" "$INFOPLIST")
-            if [ -n "$PLIST_ICON" ]; then
-              ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}*" -name "*.png" | head -n 1)
-              if [ -n "$ICON_FILE" ] && [ -f "$ICON_FILE" ]; then
-                 cp "$ICON_FILE" extracted_assets/icon.png
-                 HAS_ICON="true"
-                 echo "🖼️ Successfully found icon path from Plist entry: $ICON_FILE"
+
+          extract_icon_from_path() {
+            local ICON_FILE="$1"
+            if [ -n "$ICON_FILE" ] && [ -f "$ICON_FILE" ]; then
+              # Skip icons that are clearly too small (< 5KB) — likely @1x low-res copies
+              FILE_SIZE=$(wc -c < "$ICON_FILE")
+              if [ "$FILE_SIZE" -gt 5000 ]; then
+                cp "$ICON_FILE" extracted_assets/icon.png
+                HAS_ICON="true"
+                echo "🖼️ Icon extracted: $ICON_FILE (${FILE_SIZE} bytes)"
+                return 0
               fi
             fi
+            return 1
+          }
+
+          # Strategy 1: CFBundleIcons > CFBundlePrimaryIcon > CFBundleIconFiles array
+          for PLIST_KEY in \
+            ":CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0" \
+            ":CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles:0" \
+            ":CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName"
+          do
+            PLIST_ICON=$(/usr/libexec/PlistBuddy -c "Print $PLIST_KEY" "$INFOPLIST" 2>/dev/null || true)
+            if [ -n "$PLIST_ICON" ]; then
+              # Try exact match first, then largest resolution variant
+              ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}@3x.png" 2>/dev/null | head -n 1)
+              [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}@2x.png" 2>/dev/null | head -n 1)
+              [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}.png" 2>/dev/null | head -n 1)
+              [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}*" -name "*.png" 2>/dev/null | sort -t@ -k2 -r | head -n 1)
+              if extract_icon_from_path "$ICON_FILE"; then
+                HAS_ICON="true"
+                break
+              fi
+            fi
+          done
+
+          # Strategy 2: Scan for AppIcon*.png — pick the largest file (best resolution)
+          if [ "$HAS_ICON" = "false" ]; then
+            echo "⚠️ Plist icon lookup failed. Scanning for AppIcon PNGs by size..."
+            ICON_FILE=$(find "$APP_PATH" -name "AppIcon*.png" 2>/dev/null | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | head -n 1)
+            if extract_icon_from_path "$ICON_FILE"; then HAS_ICON="true"; fi
           fi
 
+          # Strategy 3: Broader icon/logo PNG scan — largest file wins
           if [ "$HAS_ICON" = "false" ]; then
-            echo "⚠️ Plist icon lookup empty or skipped. Scanning file tree for assets..."
-            ICON_FILE=$(find "$APP_PATH" -name "*AppIcon*" -name "*.png" | sort -r | head -n 1)
-            if [ -z "$ICON_FILE" ]; then
-              ICON_FILE=$(find "$APP_PATH" -maxdepth 1 -name "*.png" | grep -E -i "icon|logo" | head -n 1)
-            fi
-            if [ -n "$ICON_FILE" ] && [ -f "$ICON_FILE" ]; then
-              cp "$ICON_FILE" extracted_assets/icon.png
-              HAS_ICON="true"
-              echo "🖼️ Found App Icon via fallback scan: $ICON_FILE"
-            fi
+            echo "⚠️ AppIcon scan failed. Broadening search to icon/logo named PNGs..."
+            ICON_FILE=$(find "$APP_PATH" -name "*.png" 2>/dev/null | grep -Ei "icon|logo" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | head -n 1)
+            if extract_icon_from_path "$ICON_FILE"; then HAS_ICON="true"; fi
           fi
+
+          # Strategy 4: Last resort — largest PNG anywhere in the .app bundle
+          if [ "$HAS_ICON" = "false" ]; then
+            echo "⚠️ All named searches exhausted. Falling back to largest PNG in bundle..."
+            ICON_FILE=$(find "$APP_PATH" -name "*.png" 2>/dev/null | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | head -n 1)
+            if extract_icon_from_path "$ICON_FILE"; then HAS_ICON="true"; fi
+          fi
+
           echo "has_icon=$HAS_ICON" >> $GITHUB_OUTPUT
 
           # Codesigning steps
@@ -258,7 +291,7 @@ jobs:
             * **Version:** `${{ steps.resign_ipa.outputs.app_version }}`
             * **Tag:** `${{ env.TAG_NAME }}`
             * **Bundle ID:** `${{ steps.resign_ipa.outputs.bundle_id }}`
-            * **📄 Certificate Name:** `CN = ${{ steps.keychain_setup.outputs.cert_name }}`
+            * **📄 Certificate Name:** `${{ steps.keychain_setup.outputs.cert_name }}`
           files: ${{ steps.resign_ipa.outputs.output_ipa_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -323,12 +356,13 @@ jobs:
           PLIST_URL="https://huanhoahongso3-collab.github.io/autosignipacert/${{ env.TAG_NAME }}/manifest.plist"
           ITMS_URL="itms-services://?action=download-manifest&url=$PLIST_URL"
           
-          # HTML page compilation with dynamic theme engine, Space Grotesk Font, and Pink M3 design tokens
+          # HTML page compilation with dynamic theme engine, Space Grotesk Font, Pink M3 design tokens, and EN/VI i18n
           cat <<EOF > "$DEPLOY_DIR/index.html"
           <!DOCTYPE html>
           <html>
           <head>
               <title>Install $APP_TITLE</title>
+              <meta charset="UTF-8">
               <meta name="viewport" content="width=device-width, initial-scale=1">
               <link rel="preconnect" href="https://fonts.googleapis.com">
               <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -366,62 +400,55 @@ jobs:
                           --qr-matrix-bg: #ffffff;
                       }
                   }
-                  
-                  body { 
-                      font-family: 'Space Grotesk', sans-serif; 
-                      text-align: center; 
-                      padding: 40px 16px; 
-                      background-color: var(--md-sys-color-background); 
-                      color: var(--md-sys-color-on-background); 
+                  body {
+                      font-family: 'Space Grotesk', sans-serif;
+                      text-align: center;
+                      padding: 40px 16px;
+                      background-color: var(--md-sys-color-background);
+                      color: var(--md-sys-color-on-background);
                       margin: 0;
                       transition: background-color 0.25s cubic-bezier(0.2, 0, 0, 1);
                   }
-                  
-                  /* Material 3 Card Component specs */
-                  .m3-card { 
-                      background-color: var(--md-sys-color-surface); 
-                      padding: 32px 24px; 
-                      border-radius: 28px; 
+                  .m3-card {
+                      background-color: var(--md-sys-color-surface);
+                      padding: 32px 24px;
+                      border-radius: 28px;
                       box-shadow: var(--md-sys-elevation-3);
-                      display: inline-block; 
-                      max-width: 400px; 
-                      width: 100%; 
-                      box-sizing: border-box; 
+                      display: inline-block;
+                      max-width: 400px;
+                      width: 100%;
+                      box-sizing: border-box;
                       border: 1px solid var(--md-sys-color-outline-variant);
                       transition: background-color 0.25s cubic-bezier(0.2, 0, 0, 1);
                   }
-                  
-                  .app-icon { 
-                      width: 96px; 
-                      height: 96px; 
-                      border-radius: 24px; 
-                      object-fit: cover; 
+                  .app-icon {
+                      width: 96px;
+                      height: 96px;
+                      border-radius: 24px;
+                      object-fit: cover;
                       margin-bottom: 20px;
                       box-shadow: 0px 2px 4px rgba(0,0,0,0.1);
                   }
-                  
-                  .app-icon-fallback { 
-                      width: 96px; 
-                      height: 96px; 
-                      border-radius: 24px; 
-                      background: linear-gradient(135deg, var(--md-sys-color-primary), var(--md-sys-color-outline)); 
-                      color: var(--md-sys-color-on-primary); 
-                      display: flex; 
-                      align-items: center; 
-                      justify-content: center; 
-                      font-size: 40px; 
-                      font-weight: 700; 
-                      margin: 0 auto 20px auto; 
-                  }
-                  
-                  h1 { 
-                      font-size: 28px; 
+                  .app-icon-fallback {
+                      width: 96px;
+                      height: 96px;
+                      border-radius: 24px;
+                      background: linear-gradient(135deg, var(--md-sys-color-primary), var(--md-sys-color-outline));
+                      color: var(--md-sys-color-on-primary);
+                      display: flex;
+                      align-items: center;
+                      justify-content: center;
+                      font-size: 40px;
                       font-weight: 700;
-                      margin: 0 0 8px 0; 
+                      margin: 0 auto 20px auto;
+                  }
+                  h1 {
+                      font-size: 28px;
+                      font-weight: 700;
+                      margin: 0 0 8px 0;
                       letter-spacing: -0.5px;
                       color: var(--md-sys-color-on-surface);
                   }
-                  
                   .meta-container {
                       background-color: var(--md-sys-color-surface-variant);
                       border-radius: 16px;
@@ -429,7 +456,6 @@ jobs:
                       margin-bottom: 28px;
                       text-align: left;
                   }
-                  
                   .meta-row {
                       font-size: 13px;
                       line-height: 1.6;
@@ -440,58 +466,89 @@ jobs:
                       font-weight: 700;
                       color: var(--md-sys-color-on-surface);
                   }
-                  
-                  /* Material 3 Filled Button specification mapping tokens */
-                  .m3-btn { 
-                      background-color: var(--md-sys-color-primary); 
-                      color: var(--md-sys-color-on-primary); 
-                      padding: 14px 28px; 
-                      border-radius: 100px; 
-                      text-decoration: none; 
-                      font-weight: 500; 
+                  .m3-btn {
+                      background-color: var(--md-sys-color-primary);
+                      color: var(--md-sys-color-on-primary);
+                      padding: 14px 28px;
+                      border-radius: 100px;
+                      text-decoration: none;
+                      font-weight: 500;
                       font-size: 16px;
                       display: inline-flex;
                       align-items: center;
                       justify-content: center;
                       gap: 8px;
-                      margin-bottom: 28px; 
+                      margin-bottom: 28px;
                       transition: box-shadow 0.2s ease, transform 0.1s ease;
                       letter-spacing: 0.1px;
                   }
-                  .m3-btn:hover { 
+                  .m3-btn:hover {
                       box-shadow: 0px 1px 3px 1px rgba(179, 38, 101, 0.25), 0px 1px 2px rgba(0,0,0,0.3);
                       opacity: 0.92;
                   }
-                  .m3-btn:active {
-                      transform: scale(0.98);
-                  }
-                  
+                  .m3-btn:active { transform: scale(0.98); }
                   .qr-header-text {
                       font-size: 14px;
                       font-weight: 500;
                       margin-bottom: 12px;
                       color: var(--md-sys-color-on-surface);
                   }
-                  
-                  .qr-container { 
-                      display: inline-block; 
-                      background-color: var(--qr-matrix-bg); 
-                      padding: 16px; 
-                      border-radius: 16px; 
+                  .qr-container {
+                      display: inline-block;
+                      background-color: var(--qr-matrix-bg);
+                      padding: 16px;
+                      border-radius: 16px;
                       border: 1px solid var(--md-sys-color-outline-variant);
                       margin-bottom: 24px;
                   }
                   #qrcode img { margin: 0 auto; }
-                  
-                  .cert-footer { 
-                      font-size: 11px; 
-                      color: var(--md-sys-color-on-surface-variant); 
-                      font-weight: 500; 
-                      border-top: 1px solid var(--md-sys-color-outline-variant); 
-                      padding-top: 16px; 
-                      word-break: break-word; 
+                  .cert-footer {
+                      font-size: 11px;
+                      color: var(--md-sys-color-on-surface-variant);
+                      font-weight: 500;
+                      border-top: 1px solid var(--md-sys-color-outline-variant);
+                      padding-top: 16px;
+                      word-break: break-word;
                       text-align: left;
                       line-height: 1.5;
+                  }
+                  .powered-by {
+                      font-size: 11px;
+                      color: var(--md-sys-color-on-surface-variant);
+                      text-align: center;
+                      margin-top: 12px;
+                      opacity: 0.75;
+                      letter-spacing: 0.3px;
+                  }
+                  .powered-by span {
+                      font-weight: 700;
+                      color: var(--md-sys-color-primary);
+                  }
+                  /* Language toggle pill */
+                  .lang-toggle {
+                      display: inline-flex;
+                      gap: 0;
+                      border-radius: 100px;
+                      border: 1.5px solid var(--md-sys-color-outline-variant);
+                      overflow: hidden;
+                      margin-bottom: 24px;
+                      background: var(--md-sys-color-surface-variant);
+                  }
+                  .lang-btn {
+                      padding: 6px 18px;
+                      font-size: 12px;
+                      font-weight: 600;
+                      font-family: 'Space Grotesk', sans-serif;
+                      cursor: pointer;
+                      border: none;
+                      background: transparent;
+                      color: var(--md-sys-color-on-surface-variant);
+                      transition: background 0.18s, color 0.18s;
+                      letter-spacing: 0.4px;
+                  }
+                  .lang-btn.active {
+                      background: var(--md-sys-color-primary);
+                      color: var(--md-sys-color-on-primary);
                   }
               </style>
           </head>
@@ -499,34 +556,108 @@ jobs:
               <div class="m3-card">
                   $HTML_ICON_ELEMENT
                   <h1>$APP_TITLE</h1>
-                  
-                  <div class="meta-container">
-                      <div class="meta-row"><span class="meta-label">Version:</span> $APP_VERSION</div>
-                      <div class="meta-row"><span class="meta-label">Tag:</span> ${{ env.TAG_NAME }}</div>
-                      <div class="meta-row"><span class="meta-label">Bundle ID:</span> $BUNDLE_ID</div>
+
+                  <!-- Language toggle -->
+                  <div class="lang-toggle">
+                      <button class="lang-btn" id="btn-en" onclick="setLang('en')">English</button>
+                      <button class="lang-btn" id="btn-vi" onclick="setLang('vi')">Tiếng Việt</button>
                   </div>
-                  
+
+                  <div class="meta-container">
+                      <div class="meta-row"><span class="meta-label" data-i18n="version">Version</span>: $APP_VERSION</div>
+                      <div class="meta-row"><span class="meta-label" data-i18n="tag">Tag</span>: ${{ env.TAG_NAME }}</div>
+                      <div class="meta-row"><span class="meta-label" data-i18n="bundleId">Bundle ID</span>: $BUNDLE_ID</div>
+                  </div>
+
                   <a href="$ITMS_URL" class="m3-btn">
-                      <span>Tap to Install App</span>
+                      <span data-i18n="installBtn">Tap to Install App</span>
                   </a>
-                  
+
                   <div>
-                      <div class="qr-header-text">Or scan this QR code on iOS:</div>
+                      <div class="qr-header-text" data-i18n="qrLabel">Or scan this QR code on iOS:</div>
                       <div class="qr-container">
                           <div id="qrcode"></div>
                       </div>
                       <div class="cert-footer">
-                          🔒 <span style="font-weight:700;">Certificate Name:</span><br>
-                          <span style="font-family: monospace; font-size:11px; display:block; margin-top:4px;">CN = $CERT_NAME</span>
+                          🔒 <span style="font-weight:700;" data-i18n="certLabel">Certificate Name</span>:<br>
+                          <span style="font-family: monospace; font-size:11px; display:block; margin-top:4px;">$CERT_NAME</span>
                       </div>
+                      <div class="powered-by" data-i18n-html="poweredBy">Powered by <span>dhpOS</span></div>
                   </div>
               </div>
+
               <script>
+                  // ── i18n string table ──────────────────────────────────────────
+                  const I18N = {
+                      en: {
+                          pageTitle:   "Install $APP_TITLE",
+                          version:     "Version",
+                          tag:         "Tag",
+                          bundleId:    "Bundle ID",
+                          installBtn:  "Tap to Install App",
+                          qrLabel:     "Or scan this QR code on iOS:",
+                          certLabel:   "Certificate Name",
+                          poweredBy:   'Powered by <span>dhpOS</span>'
+                      },
+                      vi: {
+                          pageTitle:   "Cài đặt $APP_TITLE",
+                          version:     "Phiên bản",
+                          tag:         "Thẻ",
+                          bundleId:    "Bundle ID",
+                          installBtn:  "Nhấn để cài ứng dụng",
+                          qrLabel:     "Hoặc quét mã QR này trên iOS:",
+                          certLabel:   "Tên chứng chỉ",
+                          poweredBy:   'Được cung cấp bởi <span>dhpOS</span>'
+                      }
+                  };
+
+                  // ── Detect language from device/browser ───────────────────────
+                  function detectLang() {
+                      const langs = navigator.languages || [navigator.language || 'en'];
+                      for (const l of langs) {
+                          if (l.toLowerCase().startsWith('vi')) return 'vi';
+                      }
+                      return 'en';
+                  }
+
+                  // ── Apply language strings to DOM ─────────────────────────────
+                  function setLang(lang) {
+                      const t = I18N[lang] || I18N.en;
+                      document.title = t.pageTitle;
+
+                      // data-i18n: plain text nodes
+                      document.querySelectorAll('[data-i18n]').forEach(el => {
+                          const key = el.getAttribute('data-i18n');
+                          if (t[key] !== undefined) el.textContent = t[key];
+                      });
+
+                      // data-i18n-html: innerHTML nodes (for poweredBy with inner <span>)
+                      document.querySelectorAll('[data-i18n-html]').forEach(el => {
+                          const key = el.getAttribute('data-i18n-html');
+                          if (t[key] !== undefined) el.innerHTML = t[key];
+                      });
+
+                      // Toggle active state on buttons
+                      document.getElementById('btn-en').classList.toggle('active', lang === 'en');
+                      document.getElementById('btn-vi').classList.toggle('active', lang === 'vi');
+
+                      // Persist choice for current session
+                      try { sessionStorage.setItem('dhpos_lang', lang); } catch(e) {}
+                  }
+
+                  // ── Init ──────────────────────────────────────────────────────
+                  (function() {
+                      let lang = 'en';
+                      try { lang = sessionStorage.getItem('dhpos_lang') || detectLang(); } catch(e) { lang = detectLang(); }
+                      setLang(lang);
+                  })();
+
+                  // ── QR Code ───────────────────────────────────────────────────
                   new QRCode(document.getElementById("qrcode"), {
                       text: "$ITMS_URL",
                       width: 160,
                       height: 160,
-                      correctLevel : QRCode.CorrectLevel.L
+                      correctLevel: QRCode.CorrectLevel.L
                   });
               </script>
           </body>
