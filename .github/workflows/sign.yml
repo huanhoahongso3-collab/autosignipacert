@@ -116,10 +116,8 @@ jobs:
             exit 1
           fi
 
-          # --- CERTIFICATE COMMON NAME EXTRACTION LOGIC ---
-          # Extracts the subject common name (CN) directly out of the binary payload using openssl
+          # Extracts the full identity descriptor out of the binary payload
           CERT_SUBJECT=$(openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin "pass:$P12_PASS" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null)
-          # Parse text matching 'CN = ' out of the identity descriptor string
           CERT_CN=$(echo "$CERT_SUBJECT" | grep -oE "CN\s*=\s*[^,]+" | sed 's/CN\s*=\s*//')
           
           if [ -z "$CERT_CN" ]; then
@@ -127,7 +125,6 @@ jobs:
           fi
           echo "cert_name=$CERT_CN" >> $GITHUB_OUTPUT
           echo "📋 Extracted Certificate Name: $CERT_CN"
-          # -----------------------------------------------
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
@@ -243,15 +240,24 @@ jobs:
           rm -rf app_extracted provision.plist entitlements.plist
           echo "output_ipa_name=$OUTPUT_NAME" >> $GITHUB_OUTPUT
 
-      # 5. Create GitHub Release
+      # 5. Create GitHub Release with metadata notes
       - name: Create Release and Upload Asset
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG_NAME }}
           name: Release ${{ env.TAG_NAME }}
           body: |
-            ## 📱 Installation Link
+            ## 📱 OTA Direct Installation
             🔗 **[Click here to install ${{ steps.resign_ipa.outputs.final_app_title }} directly on iOS](https://huanhoahongso3-collab.github.io/autosignipacert/${{ env.TAG_NAME }}/)**
+            
+            ---
+            
+            ### 📋 Build Metadata Info
+            * **App Name:** `${{ steps.resign_ipa.outputs.final_app_title }}`
+            * **Version:** `${{ steps.resign_ipa.outputs.app_version }}`
+            * **Tag:** `${{ env.TAG_NAME }}`
+            * **Bundle ID:** `${{ steps.resign_ipa.outputs.bundle_id }}`
+            * **📄 Certificate Name:** `CN = ${{ steps.keychain_setup.outputs.cert_name }}`
           files: ${{ steps.resign_ipa.outputs.output_ipa_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -316,63 +322,201 @@ jobs:
           PLIST_URL="https://huanhoahongso3-collab.github.io/autosignipacert/${{ env.TAG_NAME }}/manifest.plist"
           ITMS_URL="itms-services://?action=download-manifest&url=$PLIST_URL"
           
-          # HTML page compilation (Updated with dynamic dark mode CSS & Cert name footer)
+          # HTML page compilation with dynamic theme engine, Space Grotesk Font, and M3 design tokens
           cat <<EOF > "$DEPLOY_DIR/index.html"
           <!DOCTYPE html>
           <html>
           <head>
               <title>Install $APP_TITLE</title>
               <meta name="viewport" content="width=device-width, initial-scale=1">
+              <link rel="preconnect" href="https://fonts.googleapis.com">
+              <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+              <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
               <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
               <style>
-                  /* Core CSS styling handles adaptive theme shifts natively */
+                  /* Material 3 Dynamic Baseline Palette Mapping Rules */
                   :root {
-                      --bg-color: #f5f5f7;
-                      --card-bg: white;
-                      --text-primary: #1d1d1f;
-                      --text-secondary: #86868b;
-                      --text-muted: #b2b2b6;
-                      --qr-wrapper-bg: #f5f5f7;
+                      --md-sys-color-background: #fef7ff;
+                      --md-sys-color-on-background: #1d1b20;
+                      --md-sys-color-surface: #f7f2fa;
+                      --md-sys-color-surface-variant: #e7e0ec;
+                      --md-sys-color-on-surface: #1d1b20;
+                      --md-sys-color-on-surface-variant: #49454f;
+                      --md-sys-color-primary: #6750a4;
+                      --md-sys-color-on-primary: #ffffff;
+                      --md-sys-color-outline: #79747e;
+                      --md-sys-color-outline-variant: #c4c7c5;
+                      --md-sys-elevation-3: 0px 4px 8px 3px rgba(0, 0, 0, 0.15), 0px 1px 3px rgba(0, 0, 0, 0.3);
+                      --qr-matrix-bg: #fef7ff;
                   }
                   @media (prefers-color-scheme: dark) {
                       :root {
-                          --bg-color: #000000;
-                          --card-bg: #1c1c1e;
-                          --text-primary: #f5f5f7;
-                          --text-secondary: #98989d;
-                          --text-muted: #48484a;
-                          --qr-wrapper-bg: #ffffff; /* QR code background must remain light so camera scanner functions read matrix contrast correctly */
+                          --md-sys-color-background: #141218;
+                          --md-sys-color-on-background: #e6e1e5;
+                          --md-sys-color-surface: #211f26;
+                          --md-sys-color-surface-variant: #49454f;
+                          --md-sys-color-on-surface: #e6e1e5;
+                          --md-sys-color-on-surface-variant: #cac4d0;
+                          --md-sys-color-primary: #d0bcff;
+                          --md-sys-color-on-primary: #381e72;
+                          --md-sys-color-outline: #938f99;
+                          --md-sys-color-outline-variant: #444746;
+                          --md-sys-elevation-3: 0px 4px 8px 3px rgba(0, 0, 0, 0.3), 0px 1px 3px rgba(0, 0, 0, 0.4);
+                          --qr-matrix-bg: #ffffff; /* Must remain crisp white for visual balance and camera hardware scanning decoding */
                       }
                   }
-                  body { font-family: -apple-system, sans-serif; text-align: center; padding: 50px 20px; background: var(--bg-color); color: var(--text-primary); transition: background 0.3s ease; }
-                  .card { background: var(--card-bg); padding: 30px; border-radius: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.15); display: inline-block; max-width: 400px; width: 100%; box-sizing: border-box; }
-                  .app-icon { width: 100px; height: 100px; border-radius: 22px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); object-fit: cover; margin-bottom: 15px; }
-                  .app-icon-fallback { width: 100px; height: 100px; border-radius: 22px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); background: linear-gradient(135deg, #0071e3, #1d1d1f); color: white; display: flex; align-items: center; justify-content: center; font-size: 44px; font-weight: bold; margin: 0 auto 15px auto; font-family: -apple-system, sans-serif; }
-                  h1 { color: var(--text-primary); margin: 5px 0; font-size: 24px; }
-                  p { color: var(--text-secondary); margin-top: 5px; margin-bottom: 25px; font-size: 14px; line-height: 1.5; }
-                  .btn { background: #0071e3; color: white; padding: 12px 24px; border-radius: 980px; text-decoration: none; font-weight: bold; display: inline-block; margin-bottom: 25px; font-size: 16px; }
-                  .btn:hover { background: #0077ed; }
-                  .qr-container { margin-top: 15px; display: inline-block; background: var(--qr-wrapper-bg); padding: 15px; border-radius: 12px; }
+                  
+                  body { 
+                      font-family: 'Space Grotesk', sans-serif; 
+                      text-align: center; 
+                      padding: 40px 16px; 
+                      background-color: var(--md-sys-color-background); 
+                      color: var(--md-sys-color-on-background); 
+                      margin: 0;
+                      transition: background-color 0.25s cubic-bezier(0.2, 0, 0, 1);
+                  }
+                  
+                  /* Material 3 Card Component specs */
+                  .m3-card { 
+                      background-color: var(--md-sys-color-surface); 
+                      padding: 32px 24px; 
+                      border-radius: 28px; /* M3 Medium Component border radius standard */
+                      box-shadow: var(--md-sys-elevation-3);
+                      display: inline-block; 
+                      max-width: 400px; 
+                      width: 100%; 
+                      box-sizing: border-box; 
+                      border: 1px solid var(--md-sys-color-outline-variant);
+                      transition: background-color 0.25s cubic-bezier(0.2, 0, 0, 1);
+                  }
+                  
+                  .app-icon { 
+                      width: 96px; 
+                      height: 96px; 
+                      border-radius: 24px; /* Squircle aspect mapping */
+                      object-fit: cover; 
+                      margin-bottom: 20px;
+                      box-shadow: 0px 2px 4px rgba(0,0,0,0.1);
+                  }
+                  
+                  .app-icon-fallback { 
+                      width: 96px; 
+                      height: 96px; 
+                      border-radius: 24px; 
+                      background: linear-gradient(135deg, var(--md-sys-color-primary), var(--md-sys-color-outline)); 
+                      color: var(--md-sys-color-on-primary); 
+                      display: flex; 
+                      align-items: center; 
+                      justify-content: center; 
+                      font-size: 40px; 
+                      font-weight: 700; 
+                      margin: 0 auto 20px auto; 
+                  }
+                  
+                  h1 { 
+                      font-size: 28px; 
+                      font-weight: 700;
+                      margin: 0 0 8px 0; 
+                      letter-spacing: -0.5px;
+                      color: var(--md-sys-color-on-surface);
+                  }
+                  
+                  .meta-container {
+                      background-color: var(--md-sys-color-surface-variant);
+                      border-radius: 16px;
+                      padding: 12px 16px;
+                      margin-bottom: 28px;
+                      text-align: left;
+                  }
+                  
+                  .meta-row {
+                      font-size: 13px;
+                      line-height: 1.6;
+                      color: var(--md-sys-color-on-surface-variant);
+                      word-break: break-all;
+                  }
+                  .meta-label {
+                      font-weight: 700;
+                      color: var(--md-sys-color-on-surface);
+                  }
+                  
+                  /* Material 3 Filled Button specification mapping tokens */
+                  .m3-btn { 
+                      background-color: var(--md-sys-color-primary); 
+                      color: var(--md-sys-color-on-primary); 
+                      padding: 14px 28px; 
+                      border-radius: 100px; /* Fully rounded capsule */
+                      text-decoration: none; 
+                      font-weight: 500; 
+                      font-size: 16px;
+                      display: inline-flex;
+                      align-items: center;
+                      justify-content: center;
+                      gap: 8px;
+                      margin-bottom: 28px; 
+                      transition: box-shadow 0.2s ease, transform 0.1s ease;
+                      letter-spacing: 0.1px;
+                  }
+                  .m3-btn:hover { 
+                      box-shadow: 0px 1px 3px 1px rgba(0,0,0,0.15), 0px 1px 2px rgba(0,0,0,0.3);
+                      opacity: 0.92;
+                  }
+                  .m3-btn:active {
+                      transform: scale(0.98);
+                  }
+                  
+                  .qr-header-text {
+                      font-size: 14px;
+                      font-weight: 500;
+                      margin-bottom: 12px;
+                      color: var(--md-sys-color-on-surface);
+                  }
+                  
+                  .qr-container { 
+                      display: inline-block; 
+                      background-color: var(--qr-matrix-bg); 
+                      padding: 16px; 
+                      border-radius: 16px; 
+                      border: 1px solid var(--md-sys-color-outline-variant);
+                      margin-bottom: 24px;
+                  }
                   #qrcode img { margin: 0 auto; }
-                  .cert-footer { font-size: 11px; color: var(--text-secondary); margin-top: 12px; font-weight: 500; border-top: 1px solid var(--text-muted); padding-top: 10px; word-break: break-word; }
+                  
+                  .cert-footer { 
+                      font-size: 11px; 
+                      color: var(--md-sys-color-on-surface-variant); 
+                      font-weight: 500; 
+                      border-top: 1px solid var(--md-sys-color-outline-variant); 
+                      padding-top: 16px; 
+                      word-break: break-word; 
+                      text-align: left;
+                      line-height: 1.5;
+                  }
               </style>
           </head>
           <body>
-              <div class="card">
+              <div class="m3-card">
                   $HTML_ICON_ELEMENT
                   <h1>$APP_TITLE</h1>
-                  <p>Version $APP_VERSION<br>
-                     <span style="color: var(--text-muted); font-size: 12px;">Tag: ${{ env.TAG_NAME }}</span><br>
-                     <span style="color: var(--text-muted); font-size: 12px;">ID: $BUNDLE_ID</span>
-                  </p>
-                  <a href="$ITMS_URL" class="btn">Tap to Install App</a>
+                  
+                  <div class="meta-container">
+                      <div class="meta-row"><span class="meta-label">Version:</span> $APP_VERSION</div>
+                      <div class="meta-row"><span class="meta-label">Tag:</span> ${{ env.TAG_NAME }}</div>
+                      <div class="meta-row"><span class="meta-label">Bundle ID:</span> $BUNDLE_ID</div>
+                  </div>
+                  
+                  <a href="$ITMS_URL" class="m3-btn">
+                      <span>Tap to Install App</span>
+                  </a>
+                  
                   <div>
-                      <p style="font-size: 13px; margin-bottom: 10px; color: var(--text-primary);">Or scan this QR code on iOS:</p>
+                      <div class="qr-header-text">Or scan this QR code on iOS:</div>
                       <div class="qr-container">
                           <div id="qrcode"></div>
                       </div>
                       <div class="cert-footer">
-                          📄 Certificate Name:<br><span style="font-weight: normal; font-family: monospace;">$CERT_NAME</span>
+                          🔒 <span style="font-weight:700;">Certificate Name:</span><br>
+                          <span style="font-family: monospace; font-size:11px; display:block; margin-top:4px;">CN = $CERT_NAME</span>
                       </div>
                   </div>
               </div>
