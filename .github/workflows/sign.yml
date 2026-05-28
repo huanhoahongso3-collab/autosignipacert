@@ -100,7 +100,6 @@ jobs:
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
           KEYCHAIN_PASSWORD=$(uuidgen)
           
-          # Use input password if provided, otherwise fallback to Repository Secret
           if [ -n "${{ github.event.inputs.p12_password_input }}" ]; then
             P12_PASS="${{ github.event.inputs.p12_password_input }}"
             echo "🔑 Using certificate password provided in workflow inputs."
@@ -159,7 +158,6 @@ jobs:
           # 2. Auto-extract App Title fallback logic
           INPUT_TITLE="${{ github.event.inputs.app_title }}"
           if [ -z "$INPUT_TITLE" ]; then
-            # Try to get display name first, then fallback to standard bundle name
             APP_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$INFOPLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Print :CFBundleName" "$INFOPLIST" 2>/dev/null)
             if [ -z "$APP_NAME" ]; then
               APP_NAME="${{ github.event.inputs.app_choice }}"
@@ -170,22 +168,24 @@ jobs:
           echo "final_app_title=$APP_NAME" >> $GITHUB_OUTPUT
           echo "🎯 App Title determined as: $APP_NAME"
 
-          # 3. Enhanced Icon Extraction Logic
+          # 3. Safe Icon Extraction Logic (Prevents crashing on missing keys)
           mkdir -p extracted_assets
           HAS_ICON="false"
           
-          # Read potential icon files registered inside the plist array structure
-          PLIST_ICON=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0" "$INFOPLIST" 2>/dev/null)
-          if [ -n "$PLIST_ICON" ]; then
-            ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}*" -name "*.png" | head -n 1)
-            if [ -n "$ICON_FILE" ] && [ -f "$ICON_FILE" ]; then
-               cp "$ICON_FILE" extracted_assets/icon.png
-               HAS_ICON="true"
+          if /usr/libexec/PlistBuddy -c "Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0" "$INFOPLIST" >/dev/null 2>&1; then
+            PLIST_ICON=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0" "$INFOPLIST")
+            if [ -n "$PLIST_ICON" ]; then
+              ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}*" -name "*.png" | head -n 1)
+              if [ -n "$ICON_FILE" ] && [ -f "$ICON_FILE" ]; then
+                 cp "$ICON_FILE" extracted_assets/icon.png
+                 HAS_ICON="true"
+                 echo "🖼️ Successfully found icon path from Plist entry: $ICON_FILE"
+              fi
             fi
           fi
 
-          # Fallback file system scanner search if plist lookup failed
           if [ "$HAS_ICON" = "false" ]; then
+            echo "⚠️ Plist icon lookup empty or skipped. Scanning file tree for assets..."
             ICON_FILE=$(find "$APP_PATH" -name "*AppIcon*" -name "*.png" | sort -r | head -n 1)
             if [ -z "$ICON_FILE" ]; then
               ICON_FILE=$(find "$APP_PATH" -maxdepth 1 -name "*.png" | grep -E -i "icon|logo" | head -n 1)
@@ -193,6 +193,7 @@ jobs:
             if [ -n "$ICON_FILE" ] && [ -f "$ICON_FILE" ]; then
               cp "$ICON_FILE" extracted_assets/icon.png
               HAS_ICON="true"
+              echo "🖼️ Found App Icon via fallback scan: $ICON_FILE"
             fi
           fi
           echo "has_icon=$HAS_ICON" >> $GITHUB_OUTPUT
@@ -244,12 +245,10 @@ jobs:
           BUNDLE_ID="${{ steps.resign_ipa.outputs.bundle_id }}"
           HAS_ICON="${{ steps.resign_ipa.outputs.has_icon }}"
           
-          # Handle HTML styling based on whether icon extraction found an asset
           if [ "$HAS_ICON" = "true" ]; then
             mv extracted_assets/icon.png "$DEPLOY_DIR/icon.png"
             HTML_ICON_ELEMENT="<img src=\"icon.png\" class=\"app-icon\" alt=\"App Icon\" />"
           else
-            # Fancy dynamic text logo fallback if no image file exists in the bundle bundle
             FIRST_LETTER=$(echo "$APP_TITLE" | cut -c 1 | tr '[:lower:]' '[:upper:]')
             HTML_ICON_ELEMENT="<div class=\"app-icon-fallback\">$FIRST_LETTER</div>"
           fi
@@ -306,7 +305,7 @@ jobs:
                   body { font-family: -apple-system, sans-serif; text-align: center; padding: 50px 20px; background: #f5f5f7; }
                   .card { background: white; padding: 30px; border-radius: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); display: inline-block; max-width: 400px; width: 100%; box-sizing: border-box; }
                   .app-icon { width: 100px; height: 100px; border-radius: 22px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); object-fit: cover; margin-bottom: 15px; }
-                  .app-icon-fallback { width: 100px; height: 100px; border-radius: 22px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); background: linear-gradient(135deg, #0071e3, #34a8dab); color: white; display: flex; align-items: center; justify-content: center; font-size: 44px; font-weight: bold; margin: 0 auto 15px auto; font-family: -apple-system, sans-serif; }
+                  .app-icon-fallback { width: 100px; height: 100px; border-radius: 22px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); background: linear-gradient(135deg, #0071e3, #1d1d1f); color: white; display: flex; align-items: center; justify-content: center; font-size: 44px; font-weight: bold; margin: 0 auto 15px auto; font-family: -apple-system, sans-serif; }
                   h1 { color: #1d1d1f; margin: 5px 0; font-size: 24px; }
                   p { color: #86868b; margin-top: 5px; margin-bottom: 25px; font-size: 14px; }
                   .btn { background: #0071e3; color: white; padding: 12px 24px; border-radius: 980px; text-decoration: none; font-weight: bold; display: inline-block; margin-bottom: 25px; font-size: 16px; }
