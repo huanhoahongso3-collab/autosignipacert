@@ -1,0 +1,194 @@
+name: Sign IPA, Release, and Generate Install Link
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release Tag (e.g., v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+      app_title:
+        description: 'App Title (Displayed during install prompt)'
+        required: true
+        default: 'My iOS App'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  sign-release-deploy:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 1. Setup signing inputs & Auto-Extract Bundle ID
+      - name: Install Apple Certificate and Provisioning Profile
+        id: provision_setup
+        env:
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          
+          P12_FILE=$(find . -name "*.p12" | head -n 1)
+          PROVISION_FILE=$(find . -name "*.mobileprovision" | head -n 1)
+          
+          if [ -z "$P12_FILE" ] || [ -z "$PROVISION_FILE" ]; then
+            echo "❌ Error: .p12 or .mobileprovision file not found."
+            exit 1
+          fi
+
+          # Decrypt provisioning profile to XML text to parse it
+          security cms -D -i "$PROVISION_FILE" > provision.plist
+          
+          # Extract the App ID Prefix and the full Application Identifier
+          # Application Identifier looks like: ABCDE12345.com.company.app
+          FULL_APP_ID=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" provision.plist)
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.developer.team-identifier" provision.plist)
+          
+          # Strip the Team ID prefix to isolate just the Bundle ID (e.g., com.company.app)
+          BUNDLE_ID=${FULL_APP_ID#*.}
+          
+          echo "bundle_id=$BUNDLE_ID" >> $GITHUB_OUTPUT
+          echo "✅ Auto-detected Bundle ID: $BUNDLE_ID"
+
+          # Setup Keychain and Certificate
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          security import $P12_FILE -k $KEYCHAIN_PATH -P "$P12_PASSWORD" -T /usr/bin/codesign /usr/bin/productsign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # Copy provisioning profile to system library location
+          UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" provision.plist)
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PROVISION_FILE" ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
+          
+          rm provision.plist
+
+      # 2. Resign the IPA (Auto-detects target names)
+      - name: Resign IPA
+        id: resign_ipa
+        run: |
+          IPA_FILE=$(find . -name "*.ipa" | head -n 1)
+          PROVISION_FILE=$(find . -name "*.mobileprovision" | head -n 1)
+          
+          if [ -z "$IPA_FILE" ]; then
+            echo "❌ Error: .ipa file not found."
+            exit 1
+          fi
+
+          # Generate clean name for the output file
+          CLEAN_NAME=$(basename "$IPA_FILE" | sed 's/ /_/g')
+          
+          CERT_NAME=$(security find-identity -v -p codesigning | grep -o '"[^"]*"' | head -n 1 | tr -d '"')
+          fastlane sigh resign "$IPA_FILE" --signing_identity "$CERT_NAME" --provisioning_profile "$PROVISION_FILE"
+          
+          # Rename output to a standardized URL-friendly name
+          mv "$IPA_FILE" "$CLEAN_NAME"
+          echo "output_ipa_name=$CLEAN_NAME" >> $GITHUB_OUTPUT
+
+      # 3. Create GitHub Release
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: Release ${{ github.event.inputs.release_tag }}
+          files: ${{ steps.resign_ipa.outputs.output_ipa_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 4. Generate Manifest and Webpage using auto-detected values
+      - name: Generate OTA Files
+        run: |
+          mkdir -p public
+          
+          IPA_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.release_tag }}/${{ steps.resign_ipa.outputs.output_ipa_name }}"
+          BUNDLE_ID="${{ steps.provision_setup.outputs.bundle_id }}"
+          
+          # Generate manifest.plist
+          cat <<EOF > public/manifest.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>items</key>
+              <array>
+                  <dict>
+                      <key>assets</key>
+                      <array>
+                          <dict>
+                              <key>kind</key>
+                              <string>software-package</string>
+                              <key>url</key>
+                              <string>$IPA_URL</string>
+                          </dict>
+                      </array>
+                      <key>metadata</key>
+                      <dict>
+                          <key>bundle-identifier</key>
+                          <string>$BUNDLE_ID</string>
+                          <key>bundle-version</key>
+                          <string>1.0.0</string>
+                          <key>kind</key>
+                          <string>software</string>
+                          <key>title</key>
+                          <string>${{ github.event.inputs.app_title }}</string>
+                      </dict>
+                  </dict>
+              </array>
+          </dict>
+          </plist>
+          EOF
+
+          PLIST_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/manifest.plist"
+          ITMS_URL="itms-services://?action=download-manifest&url=$PLIST_URL"
+
+          # Create landing page
+          cat <<EOF > public/index.html
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Install ${{ github.event.inputs.app_title }}</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <style>
+                  body { font-family: -apple-system, sans-serif; text-align: center; padding: 50px 20px; background: #f5f5f7; }
+                  .card { background: white; padding: 30px; border-radius: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); display: inline-block; max-width: 400px; width: 100%; }
+                  h1 { color: #1d1d1f; margin-bottom: 5px; }
+                  p { color: #86868b; margin-bottom: 25px; }
+                  .btn { background: #0071e3; color: white; padding: 12px 24px; border-radius: 980px; text-decoration: none; font-weight: bold; display: inline-block; margin-bottom: 20px; }
+                  .qr { margin-top: 20px; }
+              </style>
+          </head>
+          <body>
+              <div class="card">
+                  <h1>${{ github.event.inputs.app_title }}</h1>
+                  <p>Version ${{ github.event.inputs.release_tag }}<br><small style="color:#b2b2b6;">$BUNDLE_ID</small></p>
+                  <a href="$ITMS_URL" class="btn">Tap to Install on iOS</a>
+                  <div class="qr">
+                      <p style="font-size: 12px; margin-bottom: 10px;">Or scan this QR code on your device:</p>
+                      <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=$(echo -n $ITMS_URL | xorly -ut)" alt="QR Code" />
+                  </div>
+              </div>
+          </body>
+          </html>
+          EOF
+
+      # 5. Setup and Upload Pages Artifact
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'public'
+
+      # 6. Deploy to GitHub Pages
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
