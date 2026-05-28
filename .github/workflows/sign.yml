@@ -129,7 +129,7 @@ jobs:
           cp "$PROVISION_FILE" ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
           rm provision.plist
 
-      # 4. Unzip, Extract App Info (Bundle ID, Title, Icon), and Resign natively
+      # 4. Unzip, Extract App Info (Bundle ID, Title, Version, Icon), and Resign natively
       - name: Extract App Details and Resign IPA
         id: resign_ipa
         run: |
@@ -155,7 +155,15 @@ jobs:
           echo "bundle_id=$BUNDLE_ID" >> $GITHUB_OUTPUT
           echo "✅ Auto-detected App Bundle ID: $BUNDLE_ID"
 
-          # 2. Auto-extract App Title fallback logic
+          # 2. Auto-extract actual App Version from plist
+          APP_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFOPLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$INFOPLIST" 2>/dev/null)
+          if [ -z "$APP_VERSION" ]; then
+            APP_VERSION="1.0.0"
+          fi
+          echo "app_version=$APP_VERSION" >> $GITHUB_OUTPUT
+          echo "✅ Auto-detected App Version: $APP_VERSION"
+
+          # 3. Auto-extract App Title fallback logic
           INPUT_TITLE="${{ github.event.inputs.app_title }}"
           if [ -z "$INPUT_TITLE" ]; then
             APP_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$INFOPLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Print :CFBundleName" "$INFOPLIST" 2>/dev/null)
@@ -168,7 +176,7 @@ jobs:
           echo "final_app_title=$APP_NAME" >> $GITHUB_OUTPUT
           echo "🎯 App Title determined as: $APP_NAME"
 
-          # 3. Safe Icon Extraction Logic (Prevents crashing on missing keys)
+          # 4. Safe Icon Extraction Logic
           mkdir -p extracted_assets
           HAS_ICON="false"
           
@@ -243,6 +251,7 @@ jobs:
           
           APP_TITLE="${{ steps.resign_ipa.outputs.final_app_title }}"
           BUNDLE_ID="${{ steps.resign_ipa.outputs.bundle_id }}"
+          APP_VERSION="${{ steps.resign_ipa.outputs.app_version }}"
           HAS_ICON="${{ steps.resign_ipa.outputs.has_icon }}"
           
           if [ "$HAS_ICON" = "true" ]; then
@@ -278,7 +287,7 @@ jobs:
                           <key>bundle-identifier</key>
                           <string>$BUNDLE_ID</string>
                           <key>bundle-version</key>
-                          <string>1.0.0</string>
+                          <string>$APP_VERSION</string>
                           <key>kind</key>
                           <string>software</string>
                           <key>title</key>
@@ -307,7 +316,7 @@ jobs:
                   .app-icon { width: 100px; height: 100px; border-radius: 22px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); object-fit: cover; margin-bottom: 15px; }
                   .app-icon-fallback { width: 100px; height: 100px; border-radius: 22px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); background: linear-gradient(135deg, #0071e3, #1d1d1f); color: white; display: flex; align-items: center; justify-content: center; font-size: 44px; font-weight: bold; margin: 0 auto 15px auto; font-family: -apple-system, sans-serif; }
                   h1 { color: #1d1d1f; margin: 5px 0; font-size: 24px; }
-                  p { color: #86868b; margin-top: 5px; margin-bottom: 25px; font-size: 14px; }
+                  p { color: #86868b; margin-top: 5px; margin-bottom: 25px; font-size: 14px; line-height: 1.5; }
                   .btn { background: #0071e3; color: white; padding: 12px 24px; border-radius: 980px; text-decoration: none; font-weight: bold; display: inline-block; margin-bottom: 25px; font-size: 16px; }
                   .btn:hover { background: #0077ed; }
                   .qr-container { margin-top: 15px; display: inline-block; background: #f5f5f7; padding: 15px; border-radius: 12px; }
@@ -318,7 +327,10 @@ jobs:
               <div class="card">
                   $HTML_ICON_ELEMENT
                   <h1>$APP_TITLE</h1>
-                  <p>Version ${{ env.TAG_NAME }}<br><small style="color:#b2b2b6;">$BUNDLE_ID</small></p>
+                  <p>Version $APP_VERSION<br>
+                     <span style="color:#b2b2b6; font-size: 12px;">Tag: ${{ env.TAG_NAME }}</span><br>
+                     <span style="color:#b2b2b6; font-size: 12px;">ID: $BUNDLE_ID</span>
+                  </p>
                   <a href="$ITMS_URL" class="btn">Tap to Install App</a>
                   <div>
                       <p style="font-size: 13px; margin-bottom: 10px; color:#1d1d1f;">Or scan this QR code on iOS:</p>
