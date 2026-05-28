@@ -45,7 +45,6 @@ jobs:
         run: |
           INPUT_TAG="${{ github.event.inputs.release_tag }}"
           if [ -z "$INPUT_TAG" ]; then
-            # Generates a timestamp tag like 20260528-130522
             GENERATED_TAG=$(date +'%Y%m%d-%H%M%S')
             echo "TAG_NAME=$GENERATED_TAG" >> $GITHUB_ENV
             echo "Using dynamically generated tag: $GENERATED_TAG"
@@ -120,17 +119,69 @@ jobs:
           
           rm provision.plist
 
-      # 4. Resign the downloaded IPA
+      # 4. Resign the downloaded IPA manually using native macOS tools
       - name: Resign IPA
         id: resign_ipa
         run: |
           CLEAN_CHOICE=$(echo "${{ github.event.inputs.app_choice }}" | sed 's/ /_/g')
           OUTPUT_NAME="${CLEAN_CHOICE}-Signed.ipa"
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          # Explicitly add our custom keychain to the system search list
+          security list-keychains -s $KEYCHAIN_PATH $(security list-keychains | tr -d '"')
+
+          # Find the exact identity name inside our keychain
+          CERT_NAME=$(security find-identity -v -p codesigning $KEYCHAIN_PATH | grep -o '"[^"]*"' | head -n 1 | tr -d '"')
           
-          CERT_NAME=$(security find-identity -v -p codesigning | grep -o '"[^"]*"' | head -n 1 | tr -d '"')
-          fastlane sigh resign "target_app.ipa" --signing_identity "$CERT_NAME" --provisioning_profile "cert.mobileprovision"
+          if [ -z "$CERT_NAME" ]; then
+            echo "❌ Error: Could not find any valid code signing identities in the temporary keychain."
+            exit 1
+          fi
+          echo "🎯 Found Signing Identity: $CERT_NAME"
+
+          # Unzip the target app
+          echo "📦 Unzipping IPA..."
+          unzip -q target_app.ipa -d app_extracted
           
-          mv "target_app.ipa" "$OUTPUT_NAME"
+          # Locating the .app directory inside Payload
+          APP_PATH=$(find app_extracted/Payload -maxdepth 1 -name "*.app")
+          echo "📱 Targeting App Bundle: $APP_PATH"
+
+          # Remove existing signatures
+          rm -rf "$APP_PATH/_CodeSignature"
+
+          # Replace the old profile with your new repo root profile
+          cp cert.mobileprovision "$APP_PATH/embedded.mobileprovision"
+
+          # Extract entitlements dynamically from the provision profile to apply during signing
+          security cms -D -i cert.mobileprovision > provision.plist
+          /usr/libexec/PlistBuddy -x -c "Print :Entitlements" provision.plist > entitlements.plist
+
+          # Code sign the application binary structure
+          echo "✍️ Signing app bundle components..."
+          
+          # Sign nested frameworks or dylibs if they exist
+          if [ -d "$APP_PATH/Frameworks" ]; then
+            for framework in "$APP_PATH/Frameworks/"*; do
+              if [ -d "$framework" ] || [ -f "$framework" ]; then
+                codesign --force --sign "$CERT_NAME" --keychain $KEYCHAIN_PATH "$framework"
+              fi
+            done
+          fi
+
+          # Sign the primary app bundle along with its entitlements
+          codesign --force --sign "$CERT_NAME" --keychain $KEYCHAIN_PATH --entitlements entitlements.plist "$APP_PATH"
+
+          # Re-package back into a valid IPA file structure
+          echo "🔒 Re-packaging signed bundle..."
+          cd app_extracted
+          zip -qr ../"$OUTPUT_NAME" Payload
+          cd ..
+
+          # Cleanup workspace files
+          rm -rf app_extracted provision.plist entitlements.plist
+          
+          echo "✅ Successfully generated: $OUTPUT_NAME"
           echo "output_ipa_name=$OUTPUT_NAME" >> $GITHUB_OUTPUT
 
       # 5. Create GitHub Release using determined tag
