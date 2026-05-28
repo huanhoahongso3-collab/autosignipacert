@@ -28,8 +28,6 @@ on:
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 jobs:
   sign-release-deploy:
@@ -49,8 +47,10 @@ jobs:
             echo "TAG_NAME=$GENERATED_TAG" >> $GITHUB_ENV
             echo "Using dynamically generated tag: $GENERATED_TAG"
           else
-            echo "TAG_NAME=$INPUT_TAG" >> $GITHUB_ENV
-            echo "Using provided tag: $INPUT_TAG"
+            # Sanitize the input tag so it's a valid folder name (removes spaces, special characters)
+            CLEAN_TAG=$(echo "$INPUT_TAG" | sed 's/[^a-zA-Z0-9._-]/_/g')
+            echo "TAG_NAME=$CLEAN_TAG" >> $GITHUB_ENV
+            echo "Using provided tag: $CLEAN_TAG"
           fi
 
       # 2. Download the target IPA based on the user's dropdown choice
@@ -94,17 +94,13 @@ jobs:
             exit 1
           fi
 
-          # Decrypt provisioning profile to XML text to parse it
           security cms -D -i "$PROVISION_FILE" > provision.plist
-          
-          # Extract Bundle ID
           FULL_APP_ID=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" provision.plist)
           BUNDLE_ID=${FULL_APP_ID#*.}
           
           echo "bundle_id=$BUNDLE_ID" >> $GITHUB_OUTPUT
           echo "✅ Auto-detected Bundle ID: $BUNDLE_ID"
 
-          # Setup Keychain and Certificate
           security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
@@ -112,55 +108,59 @@ jobs:
           security import $P12_FILE -k $KEYCHAIN_PATH -P "$P12_PASSWORD" -T /usr/bin/codesign /usr/bin/productsign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
 
-          # Copy provisioning profile to system library location
           UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" provision.plist)
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           cp "$PROVISION_FILE" ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
           
           rm provision.plist
 
-      # 4. Resign the downloaded IPA manually using native macOS tools
-      - name: Resign IPA
+      # 4. Resign the downloaded IPA manually & extract Icon
+      - name: Resign IPA and Extract Icon
         id: resign_ipa
         run: |
           CLEAN_CHOICE=$(echo "${{ github.event.inputs.app_choice }}" | sed 's/ /_/g')
           OUTPUT_NAME="${CLEAN_CHOICE}-Signed.ipa"
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
 
-          # Explicitly add our custom keychain to the system search list
           security list-keychains -s $KEYCHAIN_PATH $(security list-keychains | tr -d '"')
-
-          # Find the exact identity name inside our keychain
           CERT_NAME=$(security find-identity -v -p codesigning $KEYCHAIN_PATH | grep -o '"[^"]*"' | head -n 1 | tr -d '"')
           
           if [ -z "$CERT_NAME" ]; then
-            echo "❌ Error: Could not find any valid code signing identities in the temporary keychain."
+            echo "❌ Error: Could not find any valid code signing identities."
             exit 1
           fi
-          echo "🎯 Found Signing Identity: $CERT_NAME"
 
-          # Unzip the target app
           echo "📦 Unzipping IPA..."
           unzip -q target_app.ipa -d app_extracted
-          
-          # Locating the .app directory inside Payload
           APP_PATH=$(find app_extracted/Payload -maxdepth 1 -name "*.app")
-          echo "📱 Targeting App Bundle: $APP_PATH"
 
-          # Remove existing signatures
+          # --- ICON EXTRACTION LOGIC ---
+          mkdir -p extracted_assets
+          # Find the largest AppIcon png file inside the .app bundle
+          ICON_FILE=$(find "$APP_PATH" -name "*AppIcon*" -name "*.png" | sort -r | head -n 1)
+          
+          # Fallback if specific AppIcon name string is missing
+          if [ -z "$ICON_FILE" ]; then
+            ICON_FILE=$(find "$APP_PATH" -maxdepth 1 -name "*.png" | grep -E -i "icon|logo" | head -n 1)
+          fi
+
+          if [ -n "$ICON_FILE" ]; then
+            echo "🖼️ Found App Icon inside bundle: $ICON_FILE"
+            cp "$ICON_FILE" extracted_assets/icon.png
+            # Optional: Fix crushed PNGs caused by Xcode optimization using pngcrush if available,
+            # but standard display usually works on web browsers anyway.
+          else
+            echo "⚠️ No explicit PNG App Icon found. Using a generic fallback."
+            curl -L "https://cdn-icons-png.flaticon.com/512/5738/5738031.png" -o extracted_assets/icon.png
+          fi
+          # ------------------------------
+
           rm -rf "$APP_PATH/_CodeSignature"
-
-          # Replace the old profile with your new repo root profile
           cp cert.mobileprovision "$APP_PATH/embedded.mobileprovision"
 
-          # Extract entitlements dynamically from the provision profile to apply during signing
           security cms -D -i cert.mobileprovision > provision.plist
           /usr/libexec/PlistBuddy -x -c "Print :Entitlements" provision.plist > entitlements.plist
 
-          # Code sign the application binary structure
-          echo "✍️ Signing app bundle components..."
-          
-          # Sign nested frameworks or dylibs if they exist
           if [ -d "$APP_PATH/Frameworks" ]; then
             for framework in "$APP_PATH/Frameworks/"*; do
               if [ -d "$framework" ] || [ -f "$framework" ]; then
@@ -169,41 +169,42 @@ jobs:
             done
           fi
 
-          # Sign the primary app bundle along with its entitlements
           codesign --force --sign "$CERT_NAME" --keychain $KEYCHAIN_PATH --entitlements entitlements.plist "$APP_PATH"
 
-          # Re-package back into a valid IPA file structure
-          echo "🔒 Re-packaging signed bundle..."
           cd app_extracted
           zip -qr ../"$OUTPUT_NAME" Payload
           cd ..
 
-          # Cleanup workspace files
           rm -rf app_extracted provision.plist entitlements.plist
-          
-          echo "✅ Successfully generated: $OUTPUT_NAME"
           echo "output_ipa_name=$OUTPUT_NAME" >> $GITHUB_OUTPUT
 
-      # 5. Create GitHub Release using determined tag
+      # 5. Create GitHub Release
       - name: Create Release and Upload Asset
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG_NAME }}
           name: Release ${{ env.TAG_NAME }}
+          body: |
+            ## 📱 Installation Link
+            🔗 **[Click here to install this app version directly on iOS](https://huanhoahongso3-collab.github.io/autosignipacert/${{ env.TAG_NAME }}/)**
           files: ${{ steps.resign_ipa.outputs.output_ipa_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 6. Generate Manifest and Webpage using auto-detected values
-      - name: Generate OTA Files
+      # 6. Generate Dedicated Pages Subfolder Structure
+      - name: Generate Subfolder Web Files
         run: |
-          mkdir -p public
+          DEPLOY_DIR="deploy_dir/${{ env.TAG_NAME }}"
+          mkdir -p "$DEPLOY_DIR"
+          
+          # Move extracted icon to the subfolder
+          mv extracted_assets/icon.png "$DEPLOY_DIR/icon.png"
           
           IPA_URL="https://github.com/${{ github.repository }}/releases/download/${{ env.TAG_NAME }}/${{ steps.resign_ipa.outputs.output_ipa_name }}"
           BUNDLE_ID="${{ steps.provision_setup.outputs.bundle_id }}"
           
-          # Generate manifest.plist
-          cat <<EOF > public/manifest.plist
+          # Generate manifest.plist inside the specific folder path
+          cat <<EOF > "$DEPLOY_DIR/manifest.plist"
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -237,49 +238,58 @@ jobs:
           </plist>
           EOF
 
-          PLIST_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/manifest.plist"
+          PLIST_URL="https://huanhoahongso3-collab.github.io/autosignipacert/${{ env.TAG_NAME }}/manifest.plist"
           ITMS_URL="itms-services://?action=download-manifest&url=$PLIST_URL"
-
-          # Create landing page
-          cat <<EOF > public/index.html
+          
+          # Fix for missing QR Code generation: Native SVG generation via pure javascript inside index.html
+          cat <<EOF > "$DEPLOY_DIR/index.html"
           <!DOCTYPE html>
           <html>
           <head>
               <title>Install ${{ github.event.inputs.app_title }}</title>
               <meta name="viewport" content="width=device-width, initial-scale=1">
+              <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
               <style>
                   body { font-family: -apple-system, sans-serif; text-align: center; padding: 50px 20px; background: #f5f5f7; }
-                  .card { background: white; padding: 30px; border-radius: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); display: inline-block; max-width: 400px; width: 100%; }
-                  h1 { color: #1d1d1f; margin-bottom: 5px; }
-                  p { color: #86868b; margin-bottom: 25px; }
-                  .btn { background: #0071e3; color: white; padding: 12px 24px; border-radius: 980px; text-decoration: none; font-weight: bold; display: inline-block; margin-bottom: 20px; }
-                  .qr { margin-top: 20px; }
+                  .card { background: white; padding: 30px; border-radius: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); display: inline-block; max-width: 400px; width: 100%; box-sizing: border-box; }
+                  .app-icon { width: 100px; height: 100px; border-radius: 22px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); object-fit: cover; margin-bottom: 15px; }
+                  h1 { color: #1d1d1f; margin: 5px 0; font-size: 24px; }
+                  p { color: #86868b; margin-top: 5px; margin-bottom: 25px; font-size: 14px; }
+                  .btn { background: #0071e3; color: white; padding: 14px 28px; border-radius: 980px; text-decoration: none; font-weight: bold; display: inline-block; margin-bottom: 25px; font-size: 16px; }
+                  .btn:hover { background: #0077ed; }
+                  .qr-container { margin-top: 15px; display: inline-block; background: #f5f5f7; padding: 15px; border-radius: 12px; }
+                  #qrcode img { margin: 0 auto; }
               </style>
           </head>
           <body>
               <div class="card">
+                  <img src="icon.png" class="app-icon" alt="App Icon" />
                   <h1>${{ github.event.inputs.app_title }}</h1>
                   <p>Version ${{ env.TAG_NAME }}<br><small style="color:#b2b2b6;">$BUNDLE_ID</small></p>
-                  <a href="$ITMS_URL" class="btn">Tap to Install on iOS</a>
-                  <div class="qr">
-                      <p style="font-size: 12px; margin-bottom: 10px;">Or scan this QR code on your device:</p>
-                      <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=$(echo -n $ITMS_URL | xorly -ut)" alt="QR Code" />
+                  <a href="$ITMS_URL" class="btn">Tap to Install App</a>
+                  <div>
+                      <p style="font-size: 13px; margin-bottom: 10px; color:#1d1d1f;">Or scan this QR code on iOS:</p>
+                      <div class="qr-container">
+                          <div id="qrcode"></div>
+                      </div>
                   </div>
               </div>
+              <script>
+                  new QRCode(document.getElementById("qrcode"), {
+                      text: "$ITMS_URL",
+                      width: 160,
+                      height: 160,
+                      correctLevel : QRCode.CorrectLevel.L
+                  });
+              </script>
           </body>
           </html>
           EOF
 
-      # 7. Setup and Upload Pages Artifact
-      - name: Setup Pages
-        uses: actions/configure-pages@v4
-
-      - name: Upload Artifact
-        uses: actions/upload-pages-artifact@v3
+      # 7. Push to gh-pages branch without erasing prior folders
+      - name: Deploy to GitHub Pages Branch
+        uses: JamesIves/github-pages-deploy-action@v4
         with:
-          path: 'public'
-
-      # 8. Deploy to GitHub Pages
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+          folder: deploy_dir
+          branch: gh-pages
+          clean: false # ⚠️ CRITICAL: Set to false so old version subfolders are not erased!
