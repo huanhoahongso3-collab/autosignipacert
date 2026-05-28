@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Install DiuTube</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <style>
+        body { font-family: -apple-system, sans-serif; text-align: center; padding: 50px 20px; background: #f5f5f7; }
+        .card { background: white; padding: 30px; border-radius: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); display: inline-block; max-width: 400px; width: 100%; box-sizing: border-box; }
+        .app-icon { width: 100px; height: 100px; border-radius: 22px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); object-fit: cover; margin-bottom: 15px; }
+        .app-icon-fallback { width: 100px; height: 100px; border-radius: 22px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); background: linear-gradient(135deg, #0071e3, #1d1d1f); color: white; display: flex; align-items: center; justify-content: center; font-size: 44px; font-weight: bold; margin: 0 auto 15px auto; font-family: -apple-system, sans-serif; }
+        h1 { color: #1d1d1f; margin: 5px 0; font-size: 24px; }
+        p { color: #86868b; margin-top: 5px; margin-bottom: 25px; font-size: 14px; line-height: 1.5; }
+        .btn { background: #0071e3; color: white; padding: 12px 24px; border-radius: 980px; text-decoration: none; font-weight: bold; display: inline-block; margin-bottom: 25px; font-size: 16px; }
+        .btn:hover { background: #0077ed; }
+        .qr-container { margin-top: 15px; display: inline-block; background: #f5f5f7; padding: 15px; border-radius: 12px; }
+        #qrcode img { margin: 0 auto; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <img src="icon.png" class="app-icon" alt="App Icon" />
+        <h1>DiuTube</h1>
+        <p>Version 21.08.3<br>
+           <span style="color:#b2b2b6; font-size: 12px;">Tag: 20260528-062800</span><br>
+           <span style="color:#b2b2b6; font-size: 12px;">ID: com.google.ios.youtube</span>
+        </p>
+        <a href="itms-services://?action=download-manifest&url=https://huanhoahongso3-collab.github.io/autosignipacert/20260528-062800/manifest.plist" class="btn">Tap to Install App</a>
+        <div>
+            <p style="font-size: 13px; margin-bottom: 10px; color:#1d1d1f;">Or scan this QR code on iOS:</p>
+            <div class="qr-container">
+                <div id="qrcode"></div>
+            </div>
+        </div>
+    </div>
+    <script>
+        new QRCode(document.getElementById("qrcode"), {
+            text: "itms-services://?action=download-manifest&url=https://huanhoahongso3-collab.github.io/autosignipacert/20260528-062800/manifest.plist",
+            width: 160,
+            height: 160,
+            correctLevel : QRCode.CorrectLevel.L
+        });
+    </script>
+</body>
+</html>
