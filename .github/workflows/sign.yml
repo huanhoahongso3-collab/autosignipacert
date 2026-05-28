@@ -118,7 +118,8 @@ jobs:
 
           # Extracts the full identity descriptor out of the binary payload
           CERT_SUBJECT=$(openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin "pass:$P12_PASS" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null)
-          CERT_CN=$(echo "$CERT_SUBJECT" | grep -oE "CN\s*=\s*[^,]+" | sed 's/CN\s*=\s*//')
+          # Strips out any existing "CN =" prefixes explicitly to prevent duplicate occurrences
+          CERT_CN=$(echo "$CERT_SUBJECT" | grep -oE "CN\s*=\s*[^,]+" | sed -E 's/CN\s*=\s*//g' | tr -d '"')
           
           if [ -z "$CERT_CN" ]; then
              CERT_CN="Unknown Developer / Enterprise Certificate"
@@ -322,7 +323,7 @@ jobs:
           PLIST_URL="https://huanhoahongso3-collab.github.io/autosignipacert/${{ env.TAG_NAME }}/manifest.plist"
           ITMS_URL="itms-services://?action=download-manifest&url=$PLIST_URL"
           
-          # HTML page compilation with dynamic theme engine, Space Grotesk Font, and M3 design tokens
+          # HTML page compilation with dynamic theme engine, Space Grotesk Font, and Pink M3 design tokens
           cat <<EOF > "$DEPLOY_DIR/index.html"
           <!DOCTYPE html>
           <html>
@@ -334,35 +335,35 @@ jobs:
               <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
               <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
               <style>
-                  /* Material 3 Dynamic Baseline Palette Mapping Rules */
+                  /* Material 3 Dynamic Baseline Pink Palette Mapping Tokens */
                   :root {
-                      --md-sys-color-background: #fef7ff;
-                      --md-sys-color-on-background: #1d1b20;
-                      --md-sys-color-surface: #f7f2fa;
-                      --md-sys-color-surface-variant: #e7e0ec;
-                      --md-sys-color-on-surface: #1d1b20;
-                      --md-sys-color-on-surface-variant: #49454f;
-                      --md-sys-color-primary: #6750a4;
+                      --md-sys-color-background: #fff7f9;
+                      --md-sys-color-on-background: #201a1c;
+                      --md-sys-color-surface: #ffd8e6;
+                      --md-sys-color-surface-variant: #f2dde4;
+                      --md-sys-color-on-surface: #201a1c;
+                      --md-sys-color-on-surface-variant: #514347;
+                      --md-sys-color-primary: #b32665;
                       --md-sys-color-on-primary: #ffffff;
-                      --md-sys-color-outline: #79747e;
-                      --md-sys-color-outline-variant: #c4c7c5;
-                      --md-sys-elevation-3: 0px 4px 8px 3px rgba(0, 0, 0, 0.15), 0px 1px 3px rgba(0, 0, 0, 0.3);
-                      --qr-matrix-bg: #fef7ff;
+                      --md-sys-color-outline: #837377;
+                      --md-sys-color-outline-variant: #d5c2c6;
+                      --md-sys-elevation-3: 0px 4px 8px 3px rgba(179, 38, 101, 0.08), 0px 1px 3px rgba(0, 0, 0, 0.2);
+                      --qr-matrix-bg: #fff7f9;
                   }
                   @media (prefers-color-scheme: dark) {
                       :root {
-                          --md-sys-color-background: #141218;
-                          --md-sys-color-on-background: #e6e1e5;
-                          --md-sys-color-surface: #211f26;
-                          --md-sys-color-surface-variant: #49454f;
-                          --md-sys-color-on-surface: #e6e1e5;
-                          --md-sys-color-on-surface-variant: #cac4d0;
-                          --md-sys-color-primary: #d0bcff;
-                          --md-sys-color-on-primary: #381e72;
-                          --md-sys-color-outline: #938f99;
-                          --md-sys-color-outline-variant: #444746;
-                          --md-sys-elevation-3: 0px 4px 8px 3px rgba(0, 0, 0, 0.3), 0px 1px 3px rgba(0, 0, 0, 0.4);
-                          --qr-matrix-bg: #ffffff; /* Must remain crisp white for visual balance and camera hardware scanning decoding */
+                          --md-sys-color-background: #1e1215;
+                          --md-sys-color-on-background: #f0dee2;
+                          --md-sys-color-surface: #2d1a20;
+                          --md-sys-color-surface-variant: #514347;
+                          --md-sys-color-on-surface: #f0dee2;
+                          --md-sys-color-on-surface-variant: #d5c2c6;
+                          --md-sys-color-primary: #ffb0c9;
+                          --md-sys-color-on-primary: #650033;
+                          --md-sys-color-outline: #9e8c90;
+                          --md-sys-color-outline-variant: #514347;
+                          --md-sys-elevation-3: 0px 4px 8px 3px rgba(0, 0, 0, 0.4), 0px 1px 3px rgba(0, 0, 0, 0.5);
+                          --qr-matrix-bg: #ffffff;
                       }
                   }
                   
@@ -380,7 +381,7 @@ jobs:
                   .m3-card { 
                       background-color: var(--md-sys-color-surface); 
                       padding: 32px 24px; 
-                      border-radius: 28px; /* M3 Medium Component border radius standard */
+                      border-radius: 28px; 
                       box-shadow: var(--md-sys-elevation-3);
                       display: inline-block; 
                       max-width: 400px; 
@@ -393,7 +394,7 @@ jobs:
                   .app-icon { 
                       width: 96px; 
                       height: 96px; 
-                      border-radius: 24px; /* Squircle aspect mapping */
+                      border-radius: 24px; 
                       object-fit: cover; 
                       margin-bottom: 20px;
                       box-shadow: 0px 2px 4px rgba(0,0,0,0.1);
@@ -445,7 +446,7 @@ jobs:
                       background-color: var(--md-sys-color-primary); 
                       color: var(--md-sys-color-on-primary); 
                       padding: 14px 28px; 
-                      border-radius: 100px; /* Fully rounded capsule */
+                      border-radius: 100px; 
                       text-decoration: none; 
                       font-weight: 500; 
                       font-size: 16px;
@@ -458,7 +459,7 @@ jobs:
                       letter-spacing: 0.1px;
                   }
                   .m3-btn:hover { 
-                      box-shadow: 0px 1px 3px 1px rgba(0,0,0,0.15), 0px 1px 2px rgba(0,0,0,0.3);
+                      box-shadow: 0px 1px 3px 1px rgba(179, 38, 101, 0.25), 0px 1px 2px rgba(0,0,0,0.3);
                       opacity: 0.92;
                   }
                   .m3-btn:active {
