@@ -22,9 +22,13 @@ on:
         required: false
         default: ''
       app_title:
-        description: 'App Title (Displayed during install prompt)'
-        required: true
-        default: 'My iOS App'
+        description: 'App Title (Leave blank to auto-detect from IPA)'
+        required: false
+        default: ''
+      p12_password_input:
+        description: 'Cert Password (Optional - leave blank to use repo secret)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -46,22 +50,18 @@ jobs:
           INPUT_TAG="${{ github.event.inputs.release_tag }}"
           
           if [ -z "$INPUT_TAG" ]; then
-            # Generate fallback timestamp tag
             FINAL_TAG=$(date +'%Y%m%d-%H%M%S')
             echo "TAG_NAME=$FINAL_TAG" >> $GITHUB_ENV
             echo "Using dynamically generated tag: $FINAL_TAG"
           else
-            # Sanitize the provided tag
             FINAL_TAG=$(echo "$INPUT_TAG" | sed 's/[^a-zA-Z0-9._-]/_/g')
             
-            # Check if tag already exists in the repository via GitHub API
             HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: token $GITHUB_TOKEN" \
               "https://api.github.com/repos/${{ github.repository }}/releases/tags/$FINAL_TAG")
             
             if [ "$HTTP_STATUS" = "200" ]; then
               echo "❌ ERROR: The release tag '$FINAL_TAG' already exists!"
-              echo "Workflow cancelled to prevent overwriting existing deployment folders."
               exit 1
             fi
             
@@ -93,13 +93,21 @@ jobs:
           echo "📥 Downloading IPA from: $DOWNLOAD_URL"
           curl -L "$DOWNLOAD_URL" -o target_app.ipa
 
-      # 3. Setup signing keychain using your root cert.p12
+      # 3. Determine password input or fallback secret & Setup Keychain
       - name: Install Apple Certificate
-        env:
-          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        id: keychain_setup
         run: |
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
           KEYCHAIN_PASSWORD=$(uuidgen)
+          
+          # Use input password if provided, otherwise fallback to Repository Secret
+          if [ -n "${{ github.event.inputs.p12_password_input }}" ]; then
+            P12_PASS="${{ github.event.inputs.p12_password_input }}"
+            echo "🔑 Using certificate password provided in workflow inputs."
+          else
+            P12_PASS="${{ secrets.P12_PASSWORD }}"
+            echo "🔐 Input blank. Falling back to repository secret (P12_PASSWORD)."
+          fi
           
           P12_FILE="cert.p12"
           PROVISION_FILE="cert.mobileprovision"
@@ -113,17 +121,16 @@ jobs:
           security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
 
-          security import $P12_FILE -k $KEYCHAIN_PATH -P "$P12_PASSWORD" -T /usr/bin/codesign /usr/bin/productsign
+          security import $P12_FILE -k $KEYCHAIN_PATH -P "$P12_PASS" -T /usr/bin/codesign /usr/bin/productsign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
 
-          # Place provisioning profile into system folder for modern signing context matching
           security cms -D -i "$PROVISION_FILE" > provision.plist
           UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" provision.plist)
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           cp "$PROVISION_FILE" ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
           rm provision.plist
 
-      # 4. Unzip, Extract App Details (Bundle ID & Icon), and Resign natively
+      # 4. Unzip, Extract App Info (Bundle ID, Title, Icon), and Resign natively
       - name: Extract App Details and Resign IPA
         id: resign_ipa
         run: |
@@ -142,28 +149,55 @@ jobs:
           echo "📦 Unzipping IPA..."
           unzip -q target_app.ipa -d app_extracted
           APP_PATH=$(find app_extracted/Payload -maxdepth 1 -name "*.app")
+          INFOPLIST="$APP_PATH/Info.plist"
 
-          # --- FIX: Auto-extract Bundle ID from the actual App's Info.plist ---
-          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist")
+          # 1. Auto-extract Bundle ID
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFOPLIST")
           echo "bundle_id=$BUNDLE_ID" >> $GITHUB_OUTPUT
           echo "✅ Auto-detected App Bundle ID: $BUNDLE_ID"
 
-          # --- ICON EXTRACTION ---
-          mkdir -p extracted_assets
-          ICON_FILE=$(find "$APP_PATH" -name "*AppIcon*" -name "*.png" | sort -r | head -n 1)
-          if [ -z "$ICON_FILE" ]; then
-            ICON_FILE=$(find "$APP_PATH" -maxdepth 1 -name "*.png" | grep -E -i "icon|logo" | head -n 1)
-          fi
-
-          if [ -n "$ICON_FILE" ]; then
-            echo "🖼️ Found App Icon inside bundle: $ICON_FILE"
-            cp "$ICON_FILE" extracted_assets/icon.png
+          # 2. Auto-extract App Title fallback logic
+          INPUT_TITLE="${{ github.event.inputs.app_title }}"
+          if [ -z "$INPUT_TITLE" ]; then
+            # Try to get display name first, then fallback to standard bundle name
+            APP_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$INFOPLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Print :CFBundleName" "$INFOPLIST" 2>/dev/null)
+            if [ -z "$APP_NAME" ]; then
+              APP_NAME="${{ github.event.inputs.app_choice }}"
+            fi
           else
-            echo "⚠️ No explicit PNG App Icon found. Using a generic fallback."
-            curl -L "https://cdn-icons-png.flaticon.com/512/5738/5738031.png" -o extracted_assets/icon.png
+            APP_NAME="$INPUT_TITLE"
+          fi
+          echo "final_app_title=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "🎯 App Title determined as: $APP_NAME"
+
+          # 3. Enhanced Icon Extraction Logic
+          mkdir -p extracted_assets
+          HAS_ICON="false"
+          
+          # Read potential icon files registered inside the plist array structure
+          PLIST_ICON=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0" "$INFOPLIST" 2>/dev/null)
+          if [ -n "$PLIST_ICON" ]; then
+            ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}*" -name "*.png" | head -n 1)
+            if [ -n "$ICON_FILE" ] && [ -f "$ICON_FILE" ]; then
+               cp "$ICON_FILE" extracted_assets/icon.png
+               HAS_ICON="true"
+            fi
           fi
 
-          # --- CODESIGN ---
+          # Fallback file system scanner search if plist lookup failed
+          if [ "$HAS_ICON" = "false" ]; then
+            ICON_FILE=$(find "$APP_PATH" -name "*AppIcon*" -name "*.png" | sort -r | head -n 1)
+            if [ -z "$ICON_FILE" ]; then
+              ICON_FILE=$(find "$APP_PATH" -maxdepth 1 -name "*.png" | grep -E -i "icon|logo" | head -n 1)
+            fi
+            if [ -n "$ICON_FILE" ] && [ -f "$ICON_FILE" ]; then
+              cp "$ICON_FILE" extracted_assets/icon.png
+              HAS_ICON="true"
+            fi
+          fi
+          echo "has_icon=$HAS_ICON" >> $GITHUB_OUTPUT
+
+          # Codesigning steps
           rm -rf "$APP_PATH/_CodeSignature"
           cp cert.mobileprovision "$APP_PATH/embedded.mobileprovision"
 
@@ -195,7 +229,7 @@ jobs:
           name: Release ${{ env.TAG_NAME }}
           body: |
             ## 📱 Installation Link
-            🔗 **[Click here to install this app version directly on iOS](https://huanhoahongso3-collab.github.io/autosignipacert/${{ env.TAG_NAME }}/)**
+            🔗 **[Click here to install ${{ steps.resign_ipa.outputs.final_app_title }} directly on iOS](https://huanhoahongso3-collab.github.io/autosignipacert/${{ env.TAG_NAME }}/)**
           files: ${{ steps.resign_ipa.outputs.output_ipa_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -206,10 +240,21 @@ jobs:
           DEPLOY_DIR="deploy_dir/${{ env.TAG_NAME }}"
           mkdir -p "$DEPLOY_DIR"
           
-          mv extracted_assets/icon.png "$DEPLOY_DIR/icon.png"
+          APP_TITLE="${{ steps.resign_ipa.outputs.final_app_title }}"
+          BUNDLE_ID="${{ steps.resign_ipa.outputs.bundle_id }}"
+          HAS_ICON="${{ steps.resign_ipa.outputs.has_icon }}"
+          
+          # Handle HTML styling based on whether icon extraction found an asset
+          if [ "$HAS_ICON" = "true" ]; then
+            mv extracted_assets/icon.png "$DEPLOY_DIR/icon.png"
+            HTML_ICON_ELEMENT="<img src=\"icon.png\" class=\"app-icon\" alt=\"App Icon\" />"
+          else
+            # Fancy dynamic text logo fallback if no image file exists in the bundle bundle
+            FIRST_LETTER=$(echo "$APP_TITLE" | cut -c 1 | tr '[:lower:]' '[:upper:]')
+            HTML_ICON_ELEMENT="<div class=\"app-icon-fallback\">$FIRST_LETTER</div>"
+          fi
           
           IPA_URL="https://github.com/${{ github.repository }}/releases/download/${{ env.TAG_NAME }}/${{ steps.resign_ipa.outputs.output_ipa_name }}"
-          BUNDLE_ID="${{ steps.resign_ipa.outputs.bundle_id }}"
           
           # Generate manifest.plist
           cat <<EOF > "$DEPLOY_DIR/manifest.plist"
@@ -238,7 +283,7 @@ jobs:
                           <key>kind</key>
                           <string>software</string>
                           <key>title</key>
-                          <string>${{ github.event.inputs.app_title }}</string>
+                          <string>$APP_TITLE</string>
                       </dict>
                   </dict>
               </array>
@@ -249,18 +294,19 @@ jobs:
           PLIST_URL="https://huanhoahongso3-collab.github.io/autosignipacert/${{ env.TAG_NAME }}/manifest.plist"
           ITMS_URL="itms-services://?action=download-manifest&url=$PLIST_URL"
           
-          # HTML page payload with embedded canvas script for QR creation
+          # HTML page compilation
           cat <<EOF > "$DEPLOY_DIR/index.html"
           <!DOCTYPE html>
           <html>
           <head>
-              <title>Install ${{ github.event.inputs.app_title }}</title>
+              <title>Install $APP_TITLE</title>
               <meta name="viewport" content="width=device-width, initial-scale=1">
               <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
               <style>
                   body { font-family: -apple-system, sans-serif; text-align: center; padding: 50px 20px; background: #f5f5f7; }
                   .card { background: white; padding: 30px; border-radius: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); display: inline-block; max-width: 400px; width: 100%; box-sizing: border-box; }
                   .app-icon { width: 100px; height: 100px; border-radius: 22px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); object-fit: cover; margin-bottom: 15px; }
+                  .app-icon-fallback { width: 100px; height: 100px; border-radius: 22px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); background: linear-gradient(135deg, #0071e3, #34a8dab); color: white; display: flex; align-items: center; justify-content: center; font-size: 44px; font-weight: bold; margin: 0 auto 15px auto; font-family: -apple-system, sans-serif; }
                   h1 { color: #1d1d1f; margin: 5px 0; font-size: 24px; }
                   p { color: #86868b; margin-top: 5px; margin-bottom: 25px; font-size: 14px; }
                   .btn { background: #0071e3; color: white; padding: 12px 24px; border-radius: 980px; text-decoration: none; font-weight: bold; display: inline-block; margin-bottom: 25px; font-size: 16px; }
@@ -271,8 +317,8 @@ jobs:
           </head>
           <body>
               <div class="card">
-                  <img src="icon.png" class="app-icon" alt="App Icon" />
-                  <h1>${{ github.event.inputs.app_title }}</h1>
+                  $HTML_ICON_ELEMENT
+                  <h1>$APP_TITLE</h1>
                   <p>Version ${{ env.TAG_NAME }}<br><small style="color:#b2b2b6;">$BUNDLE_ID</small></p>
                   <a href="$ITMS_URL" class="btn">Tap to Install App</a>
                   <div>
