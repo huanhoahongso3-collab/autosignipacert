@@ -207,7 +207,7 @@ jobs:
           echo "final_app_title=$APP_NAME" >> $GITHUB_OUTPUT
           echo "🎯 App Title determined as: $APP_NAME"
 
-          # 4. Universal Priority Icon Extraction Logic
+          # 4. Universal Priority Icon Extraction Logic (Subshell-Proofed)
           mkdir -p extracted_assets
           HAS_ICON="false"
 
@@ -226,7 +226,6 @@ jobs:
                 
                 # Verify that it is a valid, renderable square image asset
                 if sips -g pixelWidth extracted_assets/icon.png | grep -q "pixelWidth" 2>/dev/null; then
-                   HAS_ICON="true"
                    echo "🖼️ Icon successfully verified and copied: $ICON_FILE (${FILE_SIZE} bytes)"
                    return 0
                 fi
@@ -251,6 +250,7 @@ jobs:
                 [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}*" -name "*.png" 2>/dev/null | sort -t@ -k2 -r | head -n 1)
                 
                 if extract_icon_from_path "$ICON_FILE"; then 
+                   HAS_ICON="true"
                    break
                 fi
               fi
@@ -260,31 +260,40 @@ jobs:
           # Strategy 2: Scan for standard AppIcon assets (Excludes UI texture/sprite map configurations)
           if [ "$HAS_ICON" = "false" ]; then
             echo "⚠️ Strategy 2: Plist lookup blank. Scanning for explicit AppIcon names by dimension..."
-            find "$APP_PATH" -name "AppIcon*.png" 2>/dev/null | grep -v -E "parts|bg|opaque|spotlight|status|theme" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | while read -r f; do
+            IFS=$'\n'
+            for f in $(find "$APP_PATH" -name "AppIcon*.png" 2>/dev/null | grep -v -E "parts|bg|opaque|spotlight|status|theme" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}'); do
                if extract_icon_from_path "$f"; then 
+                  HAS_ICON="true"
                   break
                fi
             done
+            unset IFS
           fi
 
           # Strategy 3: Target standalone application logos / brand marks
           if [ "$HAS_ICON" = "false" ]; then
             echo "⚠️ Strategy 3: Broadening search to standard square icon names..."
-            find "$APP_PATH" -name "*.png" 2>/dev/null | grep -Ei "icon|logo" | grep -v -E "parts|white|trans|btn|button|sheet" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | while read -r f; do
+            IFS=$'\n'
+            for f in $(find "$APP_PATH" -name "*.png" 2>/dev/null | grep -Ei "icon|logo" | grep -v -E "parts|white|trans|btn|button|sheet" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}'); do
                if extract_icon_from_path "$f"; then 
+                  HAS_ICON="true"
                   break
                fi
             done
+            unset IFS
           fi
 
           # Strategy 4: Universal Catch-All (Isolates high resolution square graphics from binary root)
           if [ "$HAS_ICON" = "false" ]; then
             echo "⚠️ Strategy 4: All named strategies exhausted. Querying remaining app image binaries..."
-            find "$APP_PATH" -name "*.png" 2>/dev/null | grep -v -E "parts|assets|framework|cache" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | head -n 10 | while read -r f; do
+            IFS=$'\n'
+            for f in $(find "$APP_PATH" -name "*.png" 2>/dev/null | grep -v -E "parts|assets|framework|cache" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | head -n 10); do
                if extract_icon_from_path "$f"; then 
+                  HAS_ICON="true"
                   break
                fi
             done
+            unset IFS
           fi
 
           echo "Final Icon Detection Status: $HAS_ICON"
