@@ -93,7 +93,7 @@ jobs:
           echo "📥 Downloading IPA from: $DOWNLOAD_URL"
           curl -L "$DOWNLOAD_URL" -o target_app.ipa
 
-# 3. Handle password inputs, parse certificate metadata, & keychain provisioning
+      # 3. Handle password inputs, parse certificate metadata, & keychain provisioning
       - name: Install Apple Certificate & Extract Identity
         id: keychain_setup
         run: |
@@ -133,8 +133,6 @@ jobs:
           echo "cert_name=$CERT_CN" >> $GITHUB_OUTPUT
           echo "✅ Extracted Certificate Common Name: $CERT_CN"
 
-          # 🔧 MODERN FIX: Extract private key and certs directly into separate unencrypted PEM files, 
-          # then bundle them back into a clean P12 structure that macOS Security CLI can parse directly.
           echo "🔄 Re-packaging certificate keys to ensure macOS Keychain compatibility..."
           openssl pkcs12 -in "$P12_FILE" -passin "pass:$P12_PASS" -nodes -out combined_temp.pem 2>/dev/null
           openssl pkcs12 -export -in combined_temp.pem -out cert_clean.p12 -passout "pass:$P12_PASS" 2>/dev/null
@@ -209,7 +207,7 @@ jobs:
           echo "final_app_title=$APP_NAME" >> $GITHUB_OUTPUT
           echo "🎯 App Title determined as: $APP_NAME"
 
-          # 4. Enhanced Icon Extraction Logic (Fixed with CgBI conversion handling)
+          # 4. Universal Priority Icon Extraction Logic
           mkdir -p extracted_assets
           HAS_ICON="false"
 
@@ -220,13 +218,13 @@ jobs:
               if [ "$FILE_SIZE" -gt 3000 ]; then
                 cp "$ICON_FILE" extracted_assets/icon.png
                 
-                # If the PNG image uses Apple's crushed compilation format (CgBI), convert it back to standard PNG
+                # Convert Apple CgBI format back to standard readable PNG
                 if grep -q "CgBI" extracted_assets/icon.png 2>/dev/null; then
                    echo "⚡ Apple CgBI format detected. Fixing layout matrix to true readable PNG format..."
                    sips -s format png extracted_assets/icon.png --out extracted_assets/icon.png >/dev/null 2>&1
                 fi
                 
-                # Check structural pixel layout consistency metrics to confirm format validation
+                # Verify that it is a valid, renderable square image asset
                 if sips -g pixelWidth extracted_assets/icon.png | grep -q "pixelWidth" 2>/dev/null; then
                    HAS_ICON="true"
                    echo "🖼️ Icon successfully verified and copied: $ICON_FILE (${FILE_SIZE} bytes)"
@@ -237,46 +235,59 @@ jobs:
             return 1
           }
 
-          # Strategy 1: Plist metadata catalog lookup routes
-          for PLIST_KEY in \
-            ":CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0" \
-            ":CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles:0" \
-            ":CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName"
-          do
-            PLIST_ICON=$(/usr/libexec/PlistBuddy -c "Print $PLIST_KEY" "$INFOPLIST" 2>/dev/null || true)
-            if [ -n "$PLIST_ICON" ]; then
-              ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}@3x.png" 2>/dev/null | head -n 1)
-              [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}@2x.png" 2>/dev/null | head -n 1)
-              [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}.png" 2>/dev/null | head -n 1)
-              [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}*" -name "*.png" 2>/dev/null | sort -t@ -k2 -r | head -n 1)
-              if extract_icon_from_path "$ICON_FILE"; then break; fi
-            fi
-          done
-
-          # Strategy 2: Scan for explicit AppIcon file nomenclature signatures by file dimensions
+          # Strategy 1: Look up Info.plist value mapping arrays built by Xcode
           if [ "$HAS_ICON" = "false" ]; then
-            echo "⚠️ Plist icon lookup failed. Scanning for AppIcon PNGs by size..."
-            find "$APP_PATH" -name "AppIcon*.png" 2>/dev/null | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | while read -r f; do
-               if extract_icon_from_path "$f"; then break; fi
+            echo "🔍 Strategy 1: Parsing Info.plist icon catalog arrays..."
+            for PLIST_KEY in \
+              ":CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0" \
+              ":CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles:0" \
+              ":CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName"
+            do
+              PLIST_ICON=$(/usr/libexec/PlistBuddy -c "Print $PLIST_KEY" "$INFOPLIST" 2>/dev/null || true)
+              if [ -n "$PLIST_ICON" ]; then
+                ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}@3x.png" 2>/dev/null | head -n 1)
+                [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}@2x.png" 2>/dev/null | head -n 1)
+                [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}.png" 2>/dev/null | head -n 1)
+                [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}*" -name "*.png" 2>/dev/null | sort -t@ -k2 -r | head -n 1)
+                
+                if extract_icon_from_path "$ICON_FILE"; then 
+                   break
+                fi
+              fi
             done
           fi
 
-          # Strategy 3: Target design logo metrics layout bounds 
+          # Strategy 2: Scan for standard AppIcon assets (Excludes UI texture/sprite map configurations)
           if [ "$HAS_ICON" = "false" ]; then
-            echo "⚠️ AppIcon scan failed. Broadening search to icon/logo named PNGs..."
-            find "$APP_PATH" -name "*.png" 2>/dev/null | grep -Ei "icon|logo" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | while read -r f; do
-               if extract_icon_from_path "$f"; then break; fi
+            echo "⚠️ Strategy 2: Plist lookup blank. Scanning for explicit AppIcon names by dimension..."
+            find "$APP_PATH" -name "AppIcon*.png" 2>/dev/null | grep -v -E "parts|bg|opaque|spotlight|status|theme" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | while read -r f; do
+               if extract_icon_from_path "$f"; then 
+                  break
+               fi
             done
           fi
 
-          # Strategy 4: Fallback comprehensive scan structure array extraction mapping
+          # Strategy 3: Target standalone application logos / brand marks
           if [ "$HAS_ICON" = "false" ]; then
-            echo "⚠️ All named searches exhausted. Falling back to largest PNG in bundle..."
-            find "$APP_PATH" -name "*.png" 2>/dev/null | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | head -n 5 | while read -r f; do
-               if extract_icon_from_path "$f"; then break; fi
+            echo "⚠️ Strategy 3: Broadening search to standard square icon names..."
+            find "$APP_PATH" -name "*.png" 2>/dev/null | grep -Ei "icon|logo" | grep -v -E "parts|white|trans|btn|button|sheet" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | while read -r f; do
+               if extract_icon_from_path "$f"; then 
+                  break
+               fi
             done
           fi
 
+          # Strategy 4: Universal Catch-All (Isolates high resolution square graphics from binary root)
+          if [ "$HAS_ICON" = "false" ]; then
+            echo "⚠️ Strategy 4: All named strategies exhausted. Querying remaining app image binaries..."
+            find "$APP_PATH" -name "*.png" 2>/dev/null | grep -v -E "parts|assets|framework|cache" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | head -n 10 | while read -r f; do
+               if extract_icon_from_path "$f"; then 
+                  break
+               fi
+            done
+          fi
+
+          echo "Final Icon Detection Status: $HAS_ICON"
           echo "has_icon=$HAS_ICON" >> $GITHUB_OUTPUT
 
           # Codesigning steps
