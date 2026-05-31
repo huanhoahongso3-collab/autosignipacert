@@ -93,11 +93,7 @@ jobs:
           echo "📥 Downloading IPA from: $DOWNLOAD_URL"
           curl -L "$DOWNLOAD_URL" -o target_app.ipa
 
-      # 3. Determine password, Parse Cert Name, & Setup Keychain
-      #    FIX: Split -T flags (previously merged into one argument causing import failure).
-      #         Use -A (allow all apps) which is safe for ephemeral CI keychains.
-      #         Reorder keychain search list BEFORE set-key-partition-list or it silently fails.
-      #         Add -f pkcs12 to avoid format-sniffing failures on certain P12 structures.
+      # 3. Determine password input or fallback secret, Parse Cert Name, Legacy-format convert & Setup Keychain
       - name: Install Apple Certificate & Extract Identity
         id: keychain_setup
         run: |
@@ -120,41 +116,31 @@ jobs:
             exit 1
           fi
 
-          # Extract cert CN from the P12
+          # Strips out prefix descriptors safely
           CERT_SUBJECT=$(openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin "pass:$P12_PASS" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null)
           CERT_CN=$(echo "$CERT_SUBJECT" | grep -oE "CN\s*=\s*[^,/]+" | sed -E 's/^CN\s*=\s*//g' | tr -d '"' | xargs)
           
           if [ -z "$CERT_CN" ]; then
-            CERT_CN="Unknown Developer / Enterprise Certificate"
+             CERT_CN="Unknown Developer / Enterprise Certificate"
           fi
           echo "cert_name=$CERT_CN" >> $GITHUB_OUTPUT
           echo "📋 Extracted Certificate Name: $CERT_CN"
 
-          # Create and unlock keychain
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # 🔧 FIX: Re-encode the p12 into standard legacy format so macOS Security CLI can parse its MAC parameters flawlessly
+          echo "🔄 Converting certificate to legacy encryption format to guarantee macOS Keychain compatibility..."
+          openssl pkcs12 -in "$P12_FILE" -passin "pass:$P12_PASS" -out legacy_temp.pem -nodes 2>/dev/null
+          openssl pkcs12 -export -in legacy_temp.pem -out cert_legacy.p12 -passout "pass:$P12_PASS" -legacy
+          rm legacy_temp.pem
 
-          # FIX: Use -A (all apps) and explicit -f pkcs12 instead of multiple -T flags
-          #      which were being parsed as a single malformed argument.
-          security import "$P12_FILE" \
-            -k "$KEYCHAIN_PATH" \
-            -P "$P12_PASS" \
-            -f pkcs12 \
-            -A
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
 
-          # FIX: Set our keychain first in the user search list BEFORE calling
-          #      set-key-partition-list, otherwise the call silently has no effect.
-          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"' | xargs)
+          # Import using our guaranteed compatible legacy structure
+          security import cert_legacy.p12 -k $KEYCHAIN_PATH -P "$P12_PASS" -T /usr/bin/codesign /usr/bin/productsign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          rm cert_legacy.p12
 
-          # FIX: Add codesign: to the partition list alongside apple-tool: and apple:
-          security set-key-partition-list \
-            -S "apple-tool:,apple:,codesign:" \
-            -s \
-            -k "$KEYCHAIN_PASSWORD" \
-            "$KEYCHAIN_PATH"
-
-          # Install provisioning profile
           security cms -D -i "$PROVISION_FILE" > provision.plist
           UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" provision.plist)
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
@@ -162,11 +148,6 @@ jobs:
           rm provision.plist
 
       # 4. Unzip, Extract App Info (Bundle ID, Title, Version, Icon), and Resign natively
-      #    FIX: Icon extraction now decodes Apple-crushed (CgBI) PNGs via inline Python.
-      #         Apple's PNG optimizer replaces standard zlib with raw deflate and swaps
-      #         channels to BGRA. The decoder strips CgBI, re-inflates with wbits=-15
-      #         (raw deflate), swaps BGRA->RGBA per-row, and recompresses as standard PNG.
-      #         No extra dependencies required on macos-latest.
       - name: Extract App Details and Resign IPA
         id: resign_ipa
         run: |
@@ -174,8 +155,8 @@ jobs:
           OUTPUT_NAME="${CLEAN_CHOICE}-Signed.ipa"
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
 
-          security list-keychains -s "$KEYCHAIN_PATH" $(security list-keychains | tr -d '"' | xargs)
-          CERT_NAME=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -o '"[^"]*"' | head -n 1 | tr -d '"')
+          security list-keychains -s $KEYCHAIN_PATH $(security list-keychains | tr -d '"')
+          CERT_NAME=$(security find-identity -v -p codesigning $KEYCHAIN_PATH | grep -o '"[^"]*"' | head -n 1 | tr -d '"')
           
           if [ -z "$CERT_NAME" ]; then
             echo "❌ Error: Could not find any valid code signing identities."
@@ -187,12 +168,12 @@ jobs:
           APP_PATH=$(find app_extracted/Payload -maxdepth 1 -name "*.app")
           INFOPLIST="$APP_PATH/Info.plist"
 
-          # Auto-extract Bundle ID
+          # 1. Auto-extract Bundle ID
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFOPLIST")
           echo "bundle_id=$BUNDLE_ID" >> $GITHUB_OUTPUT
           echo "✅ Auto-detected App Bundle ID: $BUNDLE_ID"
 
-          # Auto-extract App Version
+          # 2. Auto-extract actual App Version from plist
           APP_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFOPLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$INFOPLIST" 2>/dev/null)
           if [ -z "$APP_VERSION" ]; then
             APP_VERSION="1.0.0"
@@ -200,7 +181,7 @@ jobs:
           echo "app_version=$APP_VERSION" >> $GITHUB_OUTPUT
           echo "✅ Auto-detected App Version: $APP_VERSION"
 
-          # App Title fallback logic
+          # 3. Auto-extract App Title fallback logic
           INPUT_TITLE="${{ github.event.inputs.app_title }}"
           if [ -z "$INPUT_TITLE" ]; then
             APP_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$INFOPLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Print :CFBundleName" "$INFOPLIST" 2>/dev/null)
@@ -213,148 +194,36 @@ jobs:
           echo "final_app_title=$APP_NAME" >> $GITHUB_OUTPUT
           echo "🎯 App Title determined as: $APP_NAME"
 
-          # ── Icon Extraction ──────────────────────────────────────────────────
-          # FIX: Apple-crushed (CgBI) PNG decoder written in pure Python stdlib.
-          # Handles: CgBI chunk removal, raw-deflate re-inflation, BGRA->RGBA swap,
-          # zlib recompression. Falls back to straight copy for normal PNGs.
+          # 4. Enhanced Icon Extraction Logic (Fixed with CgBI conversion handling)
           mkdir -p extracted_assets
           HAS_ICON="false"
-
-          # Write the decoder script once so it can be called for each candidate icon
-          cat > /tmp/fix_cgbi.py << 'PYEOF'
-import sys, struct, zlib
-
-def fix_cgbi_png(src, dst):
-    with open(src, 'rb') as f:
-        data = f.read()
-
-    # Not a PNG at all — copy verbatim
-    if data[:8] != b'\x89PNG\r\n\x1a\n':
-        with open(dst, 'wb') as f:
-            f.write(data)
-        return True
-
-    chunks_before_idat = []
-    chunks_after_idat  = []
-    idat_chunks        = []
-    has_cgbi           = False
-    past_idat          = False
-    i                  = 8
-
-    while i < len(data):
-        length     = struct.unpack('>I', data[i:i+4])[0]
-        chunk_type = data[i+4:i+8]
-        chunk_data = data[i+8:i+8+length]
-        i         += 12 + length
-
-        if chunk_type == b'CgBI':
-            has_cgbi = True
-            continue                          # drop Apple-specific chunk
-
-        if chunk_type == b'IDAT':
-            idat_chunks.append(chunk_data)
-            past_idat = True
-            continue                          # collect all IDAT together
-
-        if past_idat:
-            chunks_after_idat.append((chunk_type, chunk_data))
-        else:
-            chunks_before_idat.append((chunk_type, chunk_data))
-
-    # Regular PNG — copy as-is
-    if not has_cgbi:
-        with open(dst, 'wb') as f:
-            f.write(data)
-        return True
-
-    # Re-inflate: Apple uses raw deflate (no zlib wrapper)
-    raw = b''.join(idat_chunks)
-    try:
-        decompressed = zlib.decompress(raw, -15)   # wbits=-15 → raw deflate
-    except zlib.error:
-        try:
-            decompressed = zlib.decompress(raw)    # already standard zlib
-        except zlib.error:
-            return False                           # give up, unreadable
-
-    # Read IHDR to know dimensions and colour type
-    ihdr_data  = next((cd for ct, cd in chunks_before_idat if ct == b'IHDR'), None)
-    if ihdr_data is None:
-        return False
-
-    width      = struct.unpack('>I', ihdr_data[0:4])[0]
-    height     = struct.unpack('>I', ihdr_data[4:8])[0]
-    color_type = ihdr_data[9]   # 2=RGB, 6=RGBA
-
-    # Swap BGRA -> RGBA (Apple stores channels in BGRA order)
-    if color_type == 6:          # RGBA — 4 bytes per pixel
-        bpp      = 4
-        row_size = 1 + width * bpp
-        rows     = bytearray()
-        for row_i in range(height):
-            offset      = row_i * row_size
-            filter_byte = decompressed[offset]
-            row         = bytearray(decompressed[offset + 1 : offset + 1 + width * bpp])
-            for px in range(width):
-                b, g, r, a = row[px*4], row[px*4+1], row[px*4+2], row[px*4+3]
-                row[px*4], row[px*4+1], row[px*4+2], row[px*4+3] = r, g, b, a
-            rows += bytes([filter_byte]) + bytes(row)
-        decompressed = bytes(rows)
-    elif color_type == 2:        # RGB — 3 bytes per pixel, channels already correct
-        bpp      = 3
-        row_size = 1 + width * bpp
-        rows     = bytearray()
-        for row_i in range(height):
-            offset      = row_i * row_size
-            filter_byte = decompressed[offset]
-            row         = decompressed[offset + 1 : offset + 1 + width * bpp]
-            # BGR -> RGB
-            row_ba = bytearray(row)
-            for px in range(width):
-                b, g, r = row_ba[px*3], row_ba[px*3+1], row_ba[px*3+2]
-                row_ba[px*3], row_ba[px*3+1], row_ba[px*3+2] = r, g, b
-            rows += bytes([filter_byte]) + bytes(row_ba)
-        decompressed = bytes(rows)
-
-    recompressed = zlib.compress(decompressed, 9)
-
-    def make_chunk(ct, cd):
-        body = ct + cd
-        crc  = zlib.crc32(body) & 0xFFFFFFFF
-        return struct.pack('>I', len(cd)) + body + struct.pack('>I', crc)
-
-    out = b'\x89PNG\r\n\x1a\n'
-    for chunk_type, chunk_data in chunks_before_idat:
-        out += make_chunk(chunk_type, chunk_data)
-    out += make_chunk(b'IDAT', recompressed)
-    for chunk_type, chunk_data in chunks_after_idat:
-        out += make_chunk(chunk_type, chunk_data)
-
-    with open(dst, 'wb') as f:
-        f.write(out)
-    return True
-
-ok = fix_cgbi_png(sys.argv[1], sys.argv[2])
-sys.exit(0 if ok else 1)
-PYEOF
 
           extract_icon_from_path() {
             local ICON_FILE="$1"
             if [ -n "$ICON_FILE" ] && [ -f "$ICON_FILE" ]; then
               FILE_SIZE=$(wc -c < "$ICON_FILE")
-              if [ "$FILE_SIZE" -gt 5000 ]; then
-                # FIX: decode CgBI (Apple-crushed) PNG before storing
-                if python3 /tmp/fix_cgbi.py "$ICON_FILE" extracted_assets/icon.png 2>/dev/null; then
-                  HAS_ICON="true"
-                  echo "🖼️ Icon extracted & decoded: $ICON_FILE (${FILE_SIZE} bytes)"
-                  return 0
+              if [ "$FILE_SIZE" -gt 3000 ]; then
+                cp "$ICON_FILE" extracted_assets/icon.png
+                
+                # 🔧 FIX: If the PNG image uses Apple's crushed compilation format (CgBI), convert it back to normal PNG data
+                if grep -q "CgBI" extracted_assets/icon.png 2>/dev/null; then
+                   echo "⚡ Apple CgBI format detected. Fixing layout matrix to true readable PNG format..."
+                   # Using built-in sips tool to force reconstruction of bitmap pixels
+                   sips -s format png extracted_assets/icon.png --out extracted_assets/icon.png >/dev/null 2>&1
+                fi
+                
+                # Check validity of final PNG structure using file signature or check sizing
+                if sips -g pixelWidth extracted_assets/icon.png | grep -q "pixelWidth" 2>/dev/null; then
+                   HAS_ICON="true"
+                   echo "🖼️ Icon successfully verified and copied: $ICON_FILE (${FILE_SIZE} bytes)"
+                   return 0
                 fi
               fi
             fi
             return 1
           }
 
-          # Strategy 1: CFBundleIcons > CFBundlePrimaryIcon plist lookup
+          # Strategy 1: CFBundleIcons > CFBundlePrimaryIcon > CFBundleIconFiles array
           for PLIST_KEY in \
             ":CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0" \
             ":CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles:0" \
@@ -366,44 +235,37 @@ PYEOF
               [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}@2x.png" 2>/dev/null | head -n 1)
               [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}.png" 2>/dev/null | head -n 1)
               [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}*" -name "*.png" 2>/dev/null | sort -t@ -k2 -r | head -n 1)
-              if extract_icon_from_path "$ICON_FILE"; then
-                HAS_ICON="true"
-                break
-              fi
+              if extract_icon_from_path "$ICON_FILE"; then break; fi
             fi
           done
 
-          # Strategy 2: Scan AppIcon*.png — pick largest file (best resolution)
+          # Strategy 2: Scan for AppIcon*.png — pick the largest file
           if [ "$HAS_ICON" = "false" ]; then
             echo "⚠️ Plist icon lookup failed. Scanning for AppIcon PNGs by size..."
-            ICON_FILE=$(find "$APP_PATH" -name "AppIcon*.png" 2>/dev/null \
-              | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' \
-              | sort -rn | awk '{print $2}' | head -n 1)
-            if extract_icon_from_path "$ICON_FILE"; then HAS_ICON="true"; fi
+            find "$APP_PATH" -name "AppIcon*.png" 2>/dev/null | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | while read -r f; do
+               if extract_icon_from_path "$f"; then break; fi
+            done
           fi
 
           # Strategy 3: Broader icon/logo PNG scan — largest file wins
           if [ "$HAS_ICON" = "false" ]; then
             echo "⚠️ AppIcon scan failed. Broadening search to icon/logo named PNGs..."
-            ICON_FILE=$(find "$APP_PATH" -name "*.png" 2>/dev/null \
-              | grep -Ei "icon|logo" \
-              | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' \
-              | sort -rn | awk '{print $2}' | head -n 1)
-            if extract_icon_from_path "$ICON_FILE"; then HAS_ICON="true"; fi
+            find "$APP_PATH" -name "*.png" 2>/dev/null | grep -Ei "icon|logo" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | while read -r f; do
+               if extract_icon_from_path "$f"; then break; fi
+            done
           fi
 
-          # Strategy 4: Last resort — largest PNG anywhere in the .app bundle
+          # Strategy 4: Last resort — largest PNG anywhere in the bundle
           if [ "$HAS_ICON" = "false" ]; then
             echo "⚠️ All named searches exhausted. Falling back to largest PNG in bundle..."
-            ICON_FILE=$(find "$APP_PATH" -name "*.png" 2>/dev/null \
-              | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' \
-              | sort -rn | awk '{print $2}' | head -n 1)
-            if extract_icon_from_path "$ICON_FILE"; then HAS_ICON="true"; fi
+            find "$APP_PATH" -name "*.png" 2>/dev/null | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | head -n 5 | while read -r f; do
+               if extract_icon_from_path "$f"; then break; fi
+            done
           fi
 
           echo "has_icon=$HAS_ICON" >> $GITHUB_OUTPUT
 
-          # ── Codesigning ──────────────────────────────────────────────────────
+          # Codesigning steps
           rm -rf "$APP_PATH/_CodeSignature"
           cp cert.mobileprovision "$APP_PATH/embedded.mobileprovision"
 
@@ -413,12 +275,12 @@ PYEOF
           if [ -d "$APP_PATH/Frameworks" ]; then
             for framework in "$APP_PATH/Frameworks/"*; do
               if [ -d "$framework" ] || [ -f "$framework" ]; then
-                codesign --force --sign "$CERT_NAME" --keychain "$KEYCHAIN_PATH" "$framework"
+                codesign --force --sign "$CERT_NAME" --keychain $KEYCHAIN_PATH "$framework"
               fi
             done
           fi
 
-          codesign --force --sign "$CERT_NAME" --keychain "$KEYCHAIN_PATH" --entitlements entitlements.plist "$APP_PATH"
+          codesign --force --sign "$CERT_NAME" --keychain $KEYCHAIN_PATH --entitlements entitlements.plist "$APP_PATH"
 
           cd app_extracted
           zip -qr ../"$OUTPUT_NAME" Payload
@@ -509,6 +371,7 @@ PYEOF
           PLIST_URL="https://huanhoahongso3-collab.github.io/autosignipacert/${{ env.TAG_NAME }}/manifest.plist"
           ITMS_URL="itms-services://?action=download-manifest&url=$PLIST_URL"
           
+          # HTML page compilation
           cat <<EOF > "$DEPLOY_DIR/index.html"
           <!DOCTYPE html>
           <html>
@@ -521,7 +384,6 @@ PYEOF
               <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
               <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
               <style>
-                  /* Material 3 Dynamic Baseline Pink Palette Mapping Tokens */
                   :root {
                       --md-sys-color-background: #fff7f9;
                       --md-sys-color-on-background: #201a1c;
@@ -676,7 +538,6 @@ PYEOF
                       font-weight: 700;
                       color: var(--md-sys-color-primary);
                   }
-                  /* Language toggle pill */
                   .lang-toggle {
                       display: inline-flex;
                       gap: 0;
@@ -709,7 +570,6 @@ PYEOF
                   $HTML_ICON_ELEMENT
                   <h1>$APP_TITLE</h1>
 
-                  <!-- Language toggle -->
                   <div class="lang-toggle">
                       <button class="lang-btn" id="btn-en" onclick="setLang('en')">English</button>
                       <button class="lang-btn" id="btn-vi" onclick="setLang('vi')">Tiếng Việt</button>
@@ -739,7 +599,6 @@ PYEOF
               </div>
 
               <script>
-                  // ── i18n string table ──────────────────────────────────────────
                   const I18N = {
                       en: {
                           pageTitle:   "Install $APP_TITLE",
