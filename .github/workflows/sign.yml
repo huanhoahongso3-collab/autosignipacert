@@ -160,7 +160,7 @@ jobs:
           cp "$PROVISION_FILE" ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
           rm provision.plist
 
-      # 4. Unzip, Extract App Info (Bundle ID, Title, Version, Icon), and Resign natively
+      # 4. Unzip, Extract App Info, Query App Store API Database, and Resign
       - name: Extract App Details and Resign IPA
         id: resign_ipa
         run: |
@@ -186,7 +186,7 @@ jobs:
           echo "bundle_id=$BUNDLE_ID" >> $GITHUB_OUTPUT
           echo "✅ Auto-detected App Bundle ID: $BUNDLE_ID"
 
-          # 2. Auto-extract actual App Version from plist
+          # 2. Auto-extract actual App Version
           APP_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFOPLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$INFOPLIST" 2>/dev/null)
           if [ -z "$APP_VERSION" ]; then
             APP_VERSION="1.0.0"
@@ -207,36 +207,53 @@ jobs:
           echo "final_app_title=$APP_NAME" >> $GITHUB_OUTPUT
           echo "🎯 App Title determined as: $APP_NAME"
 
-          # 4. Universal Priority Icon Extraction Logic (Subshell-Proofed)
+          # 4. Universal Priority Icon Logic Structure
           mkdir -p extracted_assets
           HAS_ICON="false"
 
-          extract_icon_from_path() {
-            local ICON_FILE="$1"
-            if [ -n "$ICON_FILE" ] && [ -f "$ICON_FILE" ]; then
-              FILE_SIZE=$(wc -c < "$ICON_FILE")
-              if [ "$FILE_SIZE" -gt 3000 ]; then
-                cp "$ICON_FILE" extracted_assets/icon.png
-                
-                # Convert Apple CgBI format back to standard readable PNG
-                if grep -q "CgBI" extracted_assets/icon.png 2>/dev/null; then
-                   echo "⚡ Apple CgBI format detected. Fixing layout matrix to true readable PNG format..."
-                   sips -s format png extracted_assets/icon.png --out extracted_assets/icon.png >/dev/null 2>&1
-                fi
-                
-                # Verify that it is a valid, renderable square image asset
-                if sips -g pixelWidth extracted_assets/icon.png | grep -q "pixelWidth" 2>/dev/null; then
-                   echo "🖼️ Icon successfully verified and copied: $ICON_FILE (${FILE_SIZE} bytes)"
-                   return 0
+          # 🌐 STRATEGY A: Query official iTunes/App Store API via App Bundle ID
+          API_URL="https://itunes.apple.com/lookup?bundleId=$BUNDLE_ID"
+          echo "🌐 Querying App Store Database API for bundle identifier..."
+          API_RESPONSE=$(curl -s "$API_URL")
+          STORE_ICON_URL=$(echo "$API_RESPONSE" | grep -o '"artworkUrl512":"[^"]*"' | head -n 1 | sed 's/"artworkUrl512":"//' | sed 's/"//')
+
+          if [ -n "$STORE_ICON_URL" ]; then
+            echo "📥 App Store match localized! Downloading official 512px icon asset..."
+            if curl -sL "$STORE_ICON_URL" -o extracted_assets/icon.png; then
+              HAS_ICON="true"
+              echo "✅ Successfully secured clean cloud catalog artwork."
+            fi
+          fi
+
+          # 🛠️ STRATEGY B: Local Extraction Fallback (Fires only if App Store lookup returns blank)
+          if [ "$HAS_ICON" = "false" ]; then
+            echo "⚠️ App Store query yielded zero matches. Initiating secondary local folder extraction..."
+            
+            extract_icon_from_path() {
+              local ICON_FILE="$1"
+              if [ -n "$ICON_FILE" ] && [ -f "$ICON_FILE" ]; then
+                FILE_SIZE=$(wc -c < "$ICON_FILE")
+                if [ "$FILE_SIZE" -gt 3000 ]; then
+                  cp "$ICON_FILE" extracted_assets/icon.png
+                  
+                  # Convert Apple CgBI format back to standard readable PNG
+                  if grep -q "CgBI" extracted_assets/icon.png 2>/dev/null; then
+                     echo "⚡ Apple CgBI format detected. Fixing layout matrix to true readable PNG format..."
+                     sips -s format png extracted_assets/icon.png --out extracted_assets/icon.png >/dev/null 2>&1
+                  fi
+                  
+                  # Verify that it is a valid renderable image asset
+                  if sips -g pixelWidth extracted_assets/icon.png | grep -q "pixelWidth" 2>/dev/null; then
+                     echo "🖼️ Fallback icon successfully verified locally: $ICON_FILE"
+                     return 0
+                  fi
                 fi
               fi
-            fi
-            return 1
-          }
+              return 1
+            }
 
-          # Strategy 1: Look up Info.plist value mapping arrays built by Xcode
-          if [ "$HAS_ICON" = "false" ]; then
-            echo "🔍 Strategy 1: Parsing Info.plist icon catalog arrays..."
+            # Fallback 1: Parse Info.plist arrays
+            echo "🔍 Fallback 1: Parsing Info.plist icon catalog arrays..."
             for PLIST_KEY in \
               ":CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0" \
               ":CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles:0" \
@@ -255,45 +272,32 @@ jobs:
                 fi
               fi
             done
-          fi
 
-          # Strategy 2: Scan for standard AppIcon assets (Excludes UI texture/sprite map configurations)
-          if [ "$HAS_ICON" = "false" ]; then
-            echo "⚠️ Strategy 2: Plist lookup blank. Scanning for explicit AppIcon names by dimension..."
-            IFS=$'\n'
-            for f in $(find "$APP_PATH" -name "AppIcon*.png" 2>/dev/null | grep -v -E "parts|bg|opaque|spotlight|status|theme" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}'); do
-               if extract_icon_from_path "$f"; then 
-                  HAS_ICON="true"
-                  break
-               fi
-            done
-            unset IFS
-          fi
+            # Fallback 2: Scan for standard AppIcon assets (Excludes UI texture/sprite configurations)
+            if [ "$HAS_ICON" = "false" ]; then
+              echo "⚠️ Fallback 2: Scanning for explicit AppIcon structural names by dimension..."
+              IFS=$'\n'
+              for f in $(find "$APP_PATH" -name "AppIcon*.png" 2>/dev/null | grep -v -E "parts|bg|opaque|spotlight|status|theme" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}'); do
+                 if extract_icon_from_path "$f"; then 
+                    HAS_ICON="true"
+                    break
+                 fi
+              done
+              unset IFS
+            fi
 
-          # Strategy 3: Target standalone application logos / brand marks
-          if [ "$HAS_ICON" = "false" ]; then
-            echo "⚠️ Strategy 3: Broadening search to standard square icon names..."
-            IFS=$'\n'
-            for f in $(find "$APP_PATH" -name "*.png" 2>/dev/null | grep -Ei "icon|logo" | grep -v -E "parts|white|trans|btn|button|sheet" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}'); do
-               if extract_icon_from_path "$f"; then 
-                  HAS_ICON="true"
-                  break
-               fi
-            done
-            unset IFS
-          fi
-
-          # Strategy 4: Universal Catch-All (Isolates high resolution square graphics from binary root)
-          if [ "$HAS_ICON" = "false" ]; then
-            echo "⚠️ Strategy 4: All named strategies exhausted. Querying remaining app image binaries..."
-            IFS=$'\n'
-            for f in $(find "$APP_PATH" -name "*.png" 2>/dev/null | grep -v -E "parts|assets|framework|cache" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | head -n 10); do
-               if extract_icon_from_path "$f"; then 
-                  HAS_ICON="true"
-                  break
-               fi
-            done
-            unset IFS
+            # Fallback 3: Search for standard image brand targets
+            if [ "$HAS_ICON" = "false" ]; then
+              echo "⚠️ Fallback 3: Broadening search to standard square icon filename configurations..."
+              IFS=$'\n'
+              for f in $(find "$APP_PATH" -name "*.png" 2>/dev/null | grep -Ei "icon|logo" | grep -v -E "parts|white|trans|btn|button|sheet" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}'); do
+                 if extract_icon_from_path "$f"; then 
+                    HAS_ICON="true"
+                    break
+                 fi
+              done
+              unset IFS
+            fi
           fi
 
           echo "Final Icon Detection Status: $HAS_ICON"
@@ -359,11 +363,12 @@ jobs:
           
           if [ "$HAS_ICON" = "true" ]; then
             mv extracted_assets/icon.png "$DEPLOY_DIR/icon.png"
-            HTML_ICON_ELEMENT="<img src=\"icon.png\" class=\"app-icon\" alt=\"App Icon\" />"
+            HTML_ICON_ELEMENT="<img src=\"icon.png\" class=\"app-icon\" alt=\"App Icon\" onerror=\"this.style.display='none'; document.getElementById('icon-fallback-container').style.display='flex';\" />"
           else
-            FIRST_LETTER=$(echo "$APP_TITLE" | cut -c 1 | tr '[:lower:]' '[:upper:]')
-            HTML_ICON_ELEMENT="<div class=\"app-icon-fallback\">$FIRST_LETTER</div>"
+            HTML_ICON_ELEMENT=""
           fi
+          
+          FIRST_LETTER=$(echo "$APP_TITLE" | cut -c 1 | tr '[:lower:]' '[:upper:]')
           
           IPA_URL="https://github.com/${{ github.repository }}/releases/download/${{ env.TAG_NAME }}/${{ steps.resign_ipa.outputs.output_ipa_name }}"
           
@@ -455,7 +460,6 @@ jobs:
                       background-color: var(--md-sys-color-background);
                       color: var(--md-sys-color-on-background);
                       margin: 0;
-                      transition: background-color 0.25s cubic-bezier(0.2, 0, 0, 1);
                   }
                   .m3-card {
                       background-color: var(--md-sys-color-surface);
@@ -467,15 +471,15 @@ jobs:
                       width: 100%;
                       box-sizing: border-box;
                       border: 1px solid var(--md-sys-color-outline-variant);
-                      transition: background-color 0.25s cubic-bezier(0.2, 0, 0, 1);
                   }
                   .app-icon {
                       width: 96px;
                       height: 96px;
                       border-radius: 24px;
                       object-fit: cover;
-                      margin-bottom: 20px;
+                      margin: 0 auto 20px auto;
                       box-shadow: 0px 2px 4px rgba(0,0,0,0.1);
+                      display: block;
                   }
                   .app-icon-fallback {
                       width: 96px;
@@ -510,10 +514,7 @@ jobs:
                       color: var(--md-sys-color-on-surface-variant);
                       word-break: break-all;
                   }
-                  .meta-label {
-                      font-weight: 700;
-                      color: var(--md-sys-color-on-surface);
-                  }
+                  .meta-label { font-weight: 700; color: var(--md-sys-color-on-surface); }
                   .m3-btn {
                       background-color: var(--md-sys-color-primary);
                       color: var(--md-sys-color-on-primary);
@@ -525,22 +526,9 @@ jobs:
                       display: inline-flex;
                       align-items: center;
                       justify-content: center;
-                      gap: 8px;
                       margin-bottom: 28px;
-                      transition: box-shadow 0.2s ease, transform 0.1s ease;
-                      letter-spacing: 0.1px;
                   }
-                  .m3-btn:hover {
-                      box-shadow: 0px 1px 3px 1px rgba(179, 38, 101, 0.25), 0px 1px 2px rgba(0,0,0,0.3);
-                      opacity: 0.92;
-                  }
-                  .m3-btn:active { transform: scale(0.98); }
-                  .qr-header-text {
-                      font-size: 14px;
-                      font-weight: 500;
-                      margin-bottom: 12px;
-                      color: var(--md-sys-color-on-surface);
-                  }
+                  .qr-header-text { font-size: 14px; font-weight: 500; margin-bottom: 12px; }
                   .qr-container {
                       display: inline-block;
                       background-color: var(--qr-matrix-bg);
@@ -553,28 +541,14 @@ jobs:
                   .cert-footer {
                       font-size: 11px;
                       color: var(--md-sys-color-on-surface-variant);
-                      font-weight: 500;
                       border-top: 1px solid var(--md-sys-color-outline-variant);
                       padding-top: 16px;
-                      word-break: break-word;
                       text-align: left;
-                      line-height: 1.5;
                   }
-                  .powered-by {
-                      font-size: 11px;
-                      color: var(--md-sys-color-on-surface-variant);
-                      text-align: center;
-                      margin-top: 12px;
-                      opacity: 0.75;
-                      letter-spacing: 0.3px;
-                  }
-                  .powered-by span {
-                      font-weight: 700;
-                      color: var(--md-sys-color-primary);
-                  }
+                  .powered-by { font-size: 11px; color: var(--md-sys-color-on-surface-variant); margin-top: 12px; }
+                  .powered-by span { font-weight: 700; color: var(--md-sys-color-primary); }
                   .lang-toggle {
                       display: inline-flex;
-                      gap: 0;
                       border-radius: 100px;
                       border: 1.5px solid var(--md-sys-color-outline-variant);
                       overflow: hidden;
@@ -585,13 +559,10 @@ jobs:
                       padding: 6px 18px;
                       font-size: 12px;
                       font-weight: 600;
-                      font-family: 'Space Grotesk', sans-serif;
                       cursor: pointer;
                       border: none;
                       background: transparent;
                       color: var(--md-sys-color-on-surface-variant);
-                      transition: background 0.18s, color 0.18s;
-                      letter-spacing: 0.4px;
                   }
                   .lang-btn.active {
                       background: var(--md-sys-color-primary);
@@ -602,6 +573,8 @@ jobs:
           <body>
               <div class="m3-card">
                   $HTML_ICON_ELEMENT
+                  <div id="icon-fallback-container" class="app-icon-fallback" style="display: $([ "$HAS_ICON" = "true" ] && echo "none" || echo "flex");">$FIRST_LETTER</div>
+                  
                   <h1>$APP_TITLE</h1>
 
                   <div class="lang-toggle">
