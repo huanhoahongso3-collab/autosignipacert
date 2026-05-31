@@ -93,11 +93,10 @@ jobs:
           echo "📥 Downloading IPA from: $DOWNLOAD_URL"
           curl -L "$DOWNLOAD_URL" -o target_app.ipa
 
-      # 3. Handle password inputs, parse certificate metadata, legacy format conversion, & keychain provisioning
+# 3. Handle password inputs, parse certificate metadata, & keychain provisioning
       - name: Install Apple Certificate & Extract Identity
         id: keychain_setup
         run: |
-          # Disable instant exit-on-error temporarily to allow friendly error messages on verification failures
           set +e
 
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
@@ -114,10 +113,8 @@ jobs:
           P12_FILE="cert.p12"
           PROVISION_FILE="cert.mobileprovision"
           
-          # Check if identity payloads are missing from the working directory root
           if [ ! -f "$P12_FILE" ] || [ ! -f "$PROVISION_FILE" ]; then
             echo "❌ ERROR: 'cert.p12' or 'cert.mobileprovision' was not found in the root of your repository workspace."
-            echo "💡 Make sure your previous workflow logic drops these binary payloads into standard root location before executing this step."
             exit 1
           fi
 
@@ -125,12 +122,10 @@ jobs:
           CERT_SUBJECT=$(openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin "pass:$P12_PASS" 2>&1)
           if [ $? -ne 0 ]; then
              echo "❌ ERROR: OpenSSL MAC verification failed. The certificate password provided is incorrect."
-             echo "🔒 OpenSSL raw log output below:"
              echo "$CERT_SUBJECT"
              exit 1
           fi
 
-          # Safe clean stripping execution to determine CN identity values
           CERT_CN=$(echo "$CERT_SUBJECT" | openssl x509 -noout -subject 2>/dev/null | grep -oE "CN\s*=\s*[^,/]+" | sed -E 's/^CN\s*=\s*//g' | tr -d '"' | xargs)
           if [ -z "$CERT_CN" ]; then
              CERT_CN="Unknown Developer / Enterprise Certificate"
@@ -138,17 +133,18 @@ jobs:
           echo "cert_name=$CERT_CN" >> $GITHUB_OUTPUT
           echo "✅ Extracted Certificate Common Name: $CERT_CN"
 
-          echo "🔄 Re-encoding .p12 configuration with standard legacy parameters to override macOS Keychain limitations..."
-          openssl pkcs12 -in "$P12_FILE" -passin "pass:$P12_PASS" -out legacy_temp.pem -nodes 2>/dev/null
-          openssl pkcs12 -export -in legacy_temp.pem -out cert_legacy.p12 -passout "pass:$P12_PASS" -legacy 2>/dev/null
-          rm legacy_temp.pem
+          # 🔧 MODERN FIX: Extract private key and certs directly into separate unencrypted PEM files, 
+          # then bundle them back into a clean P12 structure that macOS Security CLI can parse directly.
+          echo "🔄 Re-packaging certificate keys to ensure macOS Keychain compatibility..."
+          openssl pkcs12 -in "$P12_FILE" -passin "pass:$P12_PASS" -nodes -out combined_temp.pem 2>/dev/null
+          openssl pkcs12 -export -in combined_temp.pem -out cert_clean.p12 -passout "pass:$P12_PASS" 2>/dev/null
+          rm combined_temp.pem
 
-          if [ ! -f "cert_legacy.p12" ]; then
-             echo "❌ ERROR: OpenSSL failed to export the standard legacy structure file."
+          if [ ! -f "cert_clean.p12" ]; then
+             echo "❌ ERROR: OpenSSL failed to clean and restructure the P12 container."
              exit 1
           fi
 
-          # Re-engage standard safe pipeline strict error execution bounds
           set -e
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
@@ -156,9 +152,9 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
 
           echo "📥 Importing structural key payload matrix blocks directly into keychain..."
-          security import cert_legacy.p12 -k $KEYCHAIN_PATH -P "$P12_PASS" -T /usr/bin/codesign /usr/bin/productsign
+          security import cert_clean.p12 -k $KEYCHAIN_PATH -P "$P12_PASS" -T /usr/bin/codesign /usr/bin/productsign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          rm cert_legacy.p12
+          rm cert_clean.p12
 
           security cms -D -i "$PROVISION_FILE" > provision.plist
           UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" provision.plist)
