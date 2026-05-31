@@ -93,7 +93,11 @@ jobs:
           echo "📥 Downloading IPA from: $DOWNLOAD_URL"
           curl -L "$DOWNLOAD_URL" -o target_app.ipa
 
-      # 3. Determine password input or fallback secret, Parse Cert Name, & Setup Keychain
+      # 3. Determine password, Parse Cert Name, & Setup Keychain
+      #    FIX: Split -T flags (previously merged into one argument causing import failure).
+      #         Use -A (allow all apps) which is safe for ephemeral CI keychains.
+      #         Reorder keychain search list BEFORE set-key-partition-list or it silently fails.
+      #         Add -f pkcs12 to avoid format-sniffing failures on certain P12 structures.
       - name: Install Apple Certificate & Extract Identity
         id: keychain_setup
         run: |
@@ -116,24 +120,41 @@ jobs:
             exit 1
           fi
 
-          # Extracts the full identity descriptor out of the binary payload
+          # Extract cert CN from the P12
           CERT_SUBJECT=$(openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin "pass:$P12_PASS" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null)
-          # Strips out ALL "CN =" / "CN=" prefixes to prevent duplicate CN= occurrences in output
-          CERT_CN=$(echo "$CERT_SUBJECT" | grep -oE "CN\s*=\s*[^,/]+" | sed -E 's/^CN\s*=\s*//g' | sed -E 's/^CN\s*=\s*//g' | tr -d '"' | xargs)
+          CERT_CN=$(echo "$CERT_SUBJECT" | grep -oE "CN\s*=\s*[^,/]+" | sed -E 's/^CN\s*=\s*//g' | tr -d '"' | xargs)
           
           if [ -z "$CERT_CN" ]; then
-             CERT_CN="Unknown Developer / Enterprise Certificate"
+            CERT_CN="Unknown Developer / Enterprise Certificate"
           fi
           echo "cert_name=$CERT_CN" >> $GITHUB_OUTPUT
           echo "📋 Extracted Certificate Name: $CERT_CN"
 
-          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          # Create and unlock keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          security import $P12_FILE -k $KEYCHAIN_PATH -P "$P12_PASS" -T /usr/bin/codesign /usr/bin/productsign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          # FIX: Use -A (all apps) and explicit -f pkcs12 instead of multiple -T flags
+          #      which were being parsed as a single malformed argument.
+          security import "$P12_FILE" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$P12_PASS" \
+            -f pkcs12 \
+            -A
 
+          # FIX: Set our keychain first in the user search list BEFORE calling
+          #      set-key-partition-list, otherwise the call silently has no effect.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"' | xargs)
+
+          # FIX: Add codesign: to the partition list alongside apple-tool: and apple:
+          security set-key-partition-list \
+            -S "apple-tool:,apple:,codesign:" \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          # Install provisioning profile
           security cms -D -i "$PROVISION_FILE" > provision.plist
           UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" provision.plist)
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
@@ -141,6 +162,11 @@ jobs:
           rm provision.plist
 
       # 4. Unzip, Extract App Info (Bundle ID, Title, Version, Icon), and Resign natively
+      #    FIX: Icon extraction now decodes Apple-crushed (CgBI) PNGs via inline Python.
+      #         Apple's PNG optimizer replaces standard zlib with raw deflate and swaps
+      #         channels to BGRA. The decoder strips CgBI, re-inflates with wbits=-15
+      #         (raw deflate), swaps BGRA->RGBA per-row, and recompresses as standard PNG.
+      #         No extra dependencies required on macos-latest.
       - name: Extract App Details and Resign IPA
         id: resign_ipa
         run: |
@@ -148,8 +174,8 @@ jobs:
           OUTPUT_NAME="${CLEAN_CHOICE}-Signed.ipa"
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
 
-          security list-keychains -s $KEYCHAIN_PATH $(security list-keychains | tr -d '"')
-          CERT_NAME=$(security find-identity -v -p codesigning $KEYCHAIN_PATH | grep -o '"[^"]*"' | head -n 1 | tr -d '"')
+          security list-keychains -s "$KEYCHAIN_PATH" $(security list-keychains | tr -d '"' | xargs)
+          CERT_NAME=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -o '"[^"]*"' | head -n 1 | tr -d '"')
           
           if [ -z "$CERT_NAME" ]; then
             echo "❌ Error: Could not find any valid code signing identities."
@@ -161,12 +187,12 @@ jobs:
           APP_PATH=$(find app_extracted/Payload -maxdepth 1 -name "*.app")
           INFOPLIST="$APP_PATH/Info.plist"
 
-          # 1. Auto-extract Bundle ID
+          # Auto-extract Bundle ID
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFOPLIST")
           echo "bundle_id=$BUNDLE_ID" >> $GITHUB_OUTPUT
           echo "✅ Auto-detected App Bundle ID: $BUNDLE_ID"
 
-          # 2. Auto-extract actual App Version from plist
+          # Auto-extract App Version
           APP_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFOPLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$INFOPLIST" 2>/dev/null)
           if [ -z "$APP_VERSION" ]; then
             APP_VERSION="1.0.0"
@@ -174,7 +200,7 @@ jobs:
           echo "app_version=$APP_VERSION" >> $GITHUB_OUTPUT
           echo "✅ Auto-detected App Version: $APP_VERSION"
 
-          # 3. Auto-extract App Title fallback logic
+          # App Title fallback logic
           INPUT_TITLE="${{ github.event.inputs.app_title }}"
           if [ -z "$INPUT_TITLE" ]; then
             APP_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$INFOPLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Print :CFBundleName" "$INFOPLIST" 2>/dev/null)
@@ -187,27 +213,148 @@ jobs:
           echo "final_app_title=$APP_NAME" >> $GITHUB_OUTPUT
           echo "🎯 App Title determined as: $APP_NAME"
 
-          # 4. Enhanced Icon Extraction Logic
-          # Strategy 1: Plist primary icon lookup (CFBundleIcons path)
+          # ── Icon Extraction ──────────────────────────────────────────────────
+          # FIX: Apple-crushed (CgBI) PNG decoder written in pure Python stdlib.
+          # Handles: CgBI chunk removal, raw-deflate re-inflation, BGRA->RGBA swap,
+          # zlib recompression. Falls back to straight copy for normal PNGs.
           mkdir -p extracted_assets
           HAS_ICON="false"
+
+          # Write the decoder script once so it can be called for each candidate icon
+          cat > /tmp/fix_cgbi.py << 'PYEOF'
+import sys, struct, zlib
+
+def fix_cgbi_png(src, dst):
+    with open(src, 'rb') as f:
+        data = f.read()
+
+    # Not a PNG at all — copy verbatim
+    if data[:8] != b'\x89PNG\r\n\x1a\n':
+        with open(dst, 'wb') as f:
+            f.write(data)
+        return True
+
+    chunks_before_idat = []
+    chunks_after_idat  = []
+    idat_chunks        = []
+    has_cgbi           = False
+    past_idat          = False
+    i                  = 8
+
+    while i < len(data):
+        length     = struct.unpack('>I', data[i:i+4])[0]
+        chunk_type = data[i+4:i+8]
+        chunk_data = data[i+8:i+8+length]
+        i         += 12 + length
+
+        if chunk_type == b'CgBI':
+            has_cgbi = True
+            continue                          # drop Apple-specific chunk
+
+        if chunk_type == b'IDAT':
+            idat_chunks.append(chunk_data)
+            past_idat = True
+            continue                          # collect all IDAT together
+
+        if past_idat:
+            chunks_after_idat.append((chunk_type, chunk_data))
+        else:
+            chunks_before_idat.append((chunk_type, chunk_data))
+
+    # Regular PNG — copy as-is
+    if not has_cgbi:
+        with open(dst, 'wb') as f:
+            f.write(data)
+        return True
+
+    # Re-inflate: Apple uses raw deflate (no zlib wrapper)
+    raw = b''.join(idat_chunks)
+    try:
+        decompressed = zlib.decompress(raw, -15)   # wbits=-15 → raw deflate
+    except zlib.error:
+        try:
+            decompressed = zlib.decompress(raw)    # already standard zlib
+        except zlib.error:
+            return False                           # give up, unreadable
+
+    # Read IHDR to know dimensions and colour type
+    ihdr_data  = next((cd for ct, cd in chunks_before_idat if ct == b'IHDR'), None)
+    if ihdr_data is None:
+        return False
+
+    width      = struct.unpack('>I', ihdr_data[0:4])[0]
+    height     = struct.unpack('>I', ihdr_data[4:8])[0]
+    color_type = ihdr_data[9]   # 2=RGB, 6=RGBA
+
+    # Swap BGRA -> RGBA (Apple stores channels in BGRA order)
+    if color_type == 6:          # RGBA — 4 bytes per pixel
+        bpp      = 4
+        row_size = 1 + width * bpp
+        rows     = bytearray()
+        for row_i in range(height):
+            offset      = row_i * row_size
+            filter_byte = decompressed[offset]
+            row         = bytearray(decompressed[offset + 1 : offset + 1 + width * bpp])
+            for px in range(width):
+                b, g, r, a = row[px*4], row[px*4+1], row[px*4+2], row[px*4+3]
+                row[px*4], row[px*4+1], row[px*4+2], row[px*4+3] = r, g, b, a
+            rows += bytes([filter_byte]) + bytes(row)
+        decompressed = bytes(rows)
+    elif color_type == 2:        # RGB — 3 bytes per pixel, channels already correct
+        bpp      = 3
+        row_size = 1 + width * bpp
+        rows     = bytearray()
+        for row_i in range(height):
+            offset      = row_i * row_size
+            filter_byte = decompressed[offset]
+            row         = decompressed[offset + 1 : offset + 1 + width * bpp]
+            # BGR -> RGB
+            row_ba = bytearray(row)
+            for px in range(width):
+                b, g, r = row_ba[px*3], row_ba[px*3+1], row_ba[px*3+2]
+                row_ba[px*3], row_ba[px*3+1], row_ba[px*3+2] = r, g, b
+            rows += bytes([filter_byte]) + bytes(row_ba)
+        decompressed = bytes(rows)
+
+    recompressed = zlib.compress(decompressed, 9)
+
+    def make_chunk(ct, cd):
+        body = ct + cd
+        crc  = zlib.crc32(body) & 0xFFFFFFFF
+        return struct.pack('>I', len(cd)) + body + struct.pack('>I', crc)
+
+    out = b'\x89PNG\r\n\x1a\n'
+    for chunk_type, chunk_data in chunks_before_idat:
+        out += make_chunk(chunk_type, chunk_data)
+    out += make_chunk(b'IDAT', recompressed)
+    for chunk_type, chunk_data in chunks_after_idat:
+        out += make_chunk(chunk_type, chunk_data)
+
+    with open(dst, 'wb') as f:
+        f.write(out)
+    return True
+
+ok = fix_cgbi_png(sys.argv[1], sys.argv[2])
+sys.exit(0 if ok else 1)
+PYEOF
 
           extract_icon_from_path() {
             local ICON_FILE="$1"
             if [ -n "$ICON_FILE" ] && [ -f "$ICON_FILE" ]; then
-              # Skip icons that are clearly too small (< 5KB) — likely @1x low-res copies
               FILE_SIZE=$(wc -c < "$ICON_FILE")
               if [ "$FILE_SIZE" -gt 5000 ]; then
-                cp "$ICON_FILE" extracted_assets/icon.png
-                HAS_ICON="true"
-                echo "🖼️ Icon extracted: $ICON_FILE (${FILE_SIZE} bytes)"
-                return 0
+                # FIX: decode CgBI (Apple-crushed) PNG before storing
+                if python3 /tmp/fix_cgbi.py "$ICON_FILE" extracted_assets/icon.png 2>/dev/null; then
+                  HAS_ICON="true"
+                  echo "🖼️ Icon extracted & decoded: $ICON_FILE (${FILE_SIZE} bytes)"
+                  return 0
+                fi
               fi
             fi
             return 1
           }
 
-          # Strategy 1: CFBundleIcons > CFBundlePrimaryIcon > CFBundleIconFiles array
+          # Strategy 1: CFBundleIcons > CFBundlePrimaryIcon plist lookup
           for PLIST_KEY in \
             ":CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0" \
             ":CFBundleIcons~ipad:CFBundlePrimaryIcon:CFBundleIconFiles:0" \
@@ -215,7 +362,6 @@ jobs:
           do
             PLIST_ICON=$(/usr/libexec/PlistBuddy -c "Print $PLIST_KEY" "$INFOPLIST" 2>/dev/null || true)
             if [ -n "$PLIST_ICON" ]; then
-              # Try exact match first, then largest resolution variant
               ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}@3x.png" 2>/dev/null | head -n 1)
               [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}@2x.png" 2>/dev/null | head -n 1)
               [ -z "$ICON_FILE" ] && ICON_FILE=$(find "$APP_PATH" -name "${PLIST_ICON}.png" 2>/dev/null | head -n 1)
@@ -227,30 +373,37 @@ jobs:
             fi
           done
 
-          # Strategy 2: Scan for AppIcon*.png — pick the largest file (best resolution)
+          # Strategy 2: Scan AppIcon*.png — pick largest file (best resolution)
           if [ "$HAS_ICON" = "false" ]; then
             echo "⚠️ Plist icon lookup failed. Scanning for AppIcon PNGs by size..."
-            ICON_FILE=$(find "$APP_PATH" -name "AppIcon*.png" 2>/dev/null | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | head -n 1)
+            ICON_FILE=$(find "$APP_PATH" -name "AppIcon*.png" 2>/dev/null \
+              | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' \
+              | sort -rn | awk '{print $2}' | head -n 1)
             if extract_icon_from_path "$ICON_FILE"; then HAS_ICON="true"; fi
           fi
 
           # Strategy 3: Broader icon/logo PNG scan — largest file wins
           if [ "$HAS_ICON" = "false" ]; then
             echo "⚠️ AppIcon scan failed. Broadening search to icon/logo named PNGs..."
-            ICON_FILE=$(find "$APP_PATH" -name "*.png" 2>/dev/null | grep -Ei "icon|logo" | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | head -n 1)
+            ICON_FILE=$(find "$APP_PATH" -name "*.png" 2>/dev/null \
+              | grep -Ei "icon|logo" \
+              | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' \
+              | sort -rn | awk '{print $2}' | head -n 1)
             if extract_icon_from_path "$ICON_FILE"; then HAS_ICON="true"; fi
           fi
 
           # Strategy 4: Last resort — largest PNG anywhere in the .app bundle
           if [ "$HAS_ICON" = "false" ]; then
             echo "⚠️ All named searches exhausted. Falling back to largest PNG in bundle..."
-            ICON_FILE=$(find "$APP_PATH" -name "*.png" 2>/dev/null | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' | sort -rn | awk '{print $2}' | head -n 1)
+            ICON_FILE=$(find "$APP_PATH" -name "*.png" 2>/dev/null \
+              | xargs -I{} sh -c 'echo "$(wc -c < {}) {}"' \
+              | sort -rn | awk '{print $2}' | head -n 1)
             if extract_icon_from_path "$ICON_FILE"; then HAS_ICON="true"; fi
           fi
 
           echo "has_icon=$HAS_ICON" >> $GITHUB_OUTPUT
 
-          # Codesigning steps
+          # ── Codesigning ──────────────────────────────────────────────────────
           rm -rf "$APP_PATH/_CodeSignature"
           cp cert.mobileprovision "$APP_PATH/embedded.mobileprovision"
 
@@ -260,12 +413,12 @@ jobs:
           if [ -d "$APP_PATH/Frameworks" ]; then
             for framework in "$APP_PATH/Frameworks/"*; do
               if [ -d "$framework" ] || [ -f "$framework" ]; then
-                codesign --force --sign "$CERT_NAME" --keychain $KEYCHAIN_PATH "$framework"
+                codesign --force --sign "$CERT_NAME" --keychain "$KEYCHAIN_PATH" "$framework"
               fi
             done
           fi
 
-          codesign --force --sign "$CERT_NAME" --keychain $KEYCHAIN_PATH --entitlements entitlements.plist "$APP_PATH"
+          codesign --force --sign "$CERT_NAME" --keychain "$KEYCHAIN_PATH" --entitlements entitlements.plist "$APP_PATH"
 
           cd app_extracted
           zip -qr ../"$OUTPUT_NAME" Payload
@@ -356,7 +509,6 @@ jobs:
           PLIST_URL="https://huanhoahongso3-collab.github.io/autosignipacert/${{ env.TAG_NAME }}/manifest.plist"
           ITMS_URL="itms-services://?action=download-manifest&url=$PLIST_URL"
           
-          # HTML page compilation with dynamic theme engine, Space Grotesk Font, Pink M3 design tokens, and EN/VI i18n
           cat <<EOF > "$DEPLOY_DIR/index.html"
           <!DOCTYPE html>
           <html>
@@ -611,7 +763,6 @@ jobs:
                       }
                   };
 
-                  // ── Detect language from device/browser ───────────────────────
                   function detectLang() {
                       const langs = navigator.languages || [navigator.language || 'en'];
                       for (const l of langs) {
@@ -620,39 +771,32 @@ jobs:
                       return 'en';
                   }
 
-                  // ── Apply language strings to DOM ─────────────────────────────
                   function setLang(lang) {
                       const t = I18N[lang] || I18N.en;
                       document.title = t.pageTitle;
 
-                      // data-i18n: plain text nodes
                       document.querySelectorAll('[data-i18n]').forEach(el => {
                           const key = el.getAttribute('data-i18n');
                           if (t[key] !== undefined) el.textContent = t[key];
                       });
 
-                      // data-i18n-html: innerHTML nodes (for poweredBy with inner <span>)
                       document.querySelectorAll('[data-i18n-html]').forEach(el => {
                           const key = el.getAttribute('data-i18n-html');
                           if (t[key] !== undefined) el.innerHTML = t[key];
                       });
 
-                      // Toggle active state on buttons
                       document.getElementById('btn-en').classList.toggle('active', lang === 'en');
                       document.getElementById('btn-vi').classList.toggle('active', lang === 'vi');
 
-                      // Persist choice for current session
                       try { sessionStorage.setItem('dhpos_lang', lang); } catch(e) {}
                   }
 
-                  // ── Init ──────────────────────────────────────────────────────
                   (function() {
                       let lang = 'en';
                       try { lang = sessionStorage.getItem('dhpos_lang') || detectLang(); } catch(e) { lang = detectLang(); }
                       setLang(lang);
                   })();
 
-                  // ── QR Code ───────────────────────────────────────────────────
                   new QRCode(document.getElementById("qrcode"), {
                       text: "$ITMS_URL",
                       width: 160,
