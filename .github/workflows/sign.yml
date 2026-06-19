@@ -17,6 +17,14 @@ on:
         description: 'Custom IPA Download URL (Only used if "Custom" is selected)'
         required: false
         default: ''
+      custom_p12_url:
+        description: 'Custom P12 URL (Optional - leave blank to use local cert.p12)'
+        required: false
+        default: ''
+      custom_provision_url:
+        description: 'Custom Mobileprovision URL (Optional - leave blank to use local cert.mobileprovision)'
+        required: false
+        default: ''
       release_tag:
         description: 'Release Tag (Leave blank for current date & time)'
         required: false
@@ -93,7 +101,7 @@ jobs:
           echo "📥 Downloading IPA from: $DOWNLOAD_URL"
           curl -L "$DOWNLOAD_URL" -o target_app.ipa
 
-      # 3. Handle password inputs, parse certificate metadata, & keychain provisioning
+      # 3. Handle Certificate & Provisioning Profile Download / Verification
       - name: Install Apple Certificate & Extract Identity
         id: keychain_setup
         run: |
@@ -101,6 +109,21 @@ jobs:
 
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
           KEYCHAIN_PASSWORD=$(uuidgen)
+          
+          P12_FILE="cert.p12"
+          PROVISION_FILE="cert.mobileprovision"
+
+          # Fetch remote P12 asset if link is supplied
+          if [ -n "${{ github.event.inputs.custom_p12_url }}" ]; then
+            echo "🌐 Downloading custom P12 certificate file..."
+            curl -L "${{ github.event.inputs.custom_p12_url }}" -o "$P12_FILE"
+          fi
+
+          # Fetch remote profile asset if link is supplied
+          if [ -n "${{ github.event.inputs.custom_provision_url }}" ]; then
+            echo "🌐 Downloading custom mobileprovision file..."
+            curl -L "${{ github.event.inputs.custom_provision_url }}" -o "$PROVISION_FILE"
+          fi
           
           if [ -n "${{ github.event.inputs.p12_password_input }}" ]; then
             P12_PASS="${{ github.event.inputs.p12_password_input }}"
@@ -110,11 +133,8 @@ jobs:
             echo "🔐 Input blank. Falling back to repository secret (P12_PASSWORD)."
           fi
           
-          P12_FILE="cert.p12"
-          PROVISION_FILE="cert.mobileprovision"
-          
           if [ ! -f "$P12_FILE" ] || [ ! -f "$PROVISION_FILE" ]; then
-            echo "❌ ERROR: 'cert.p12' or 'cert.mobileprovision' was not found in the root of your repository workspace."
+            echo "❌ ERROR: Certificate payloads missing. Verify workspace paths or remote asset download endpoints."
             exit 1
           fi
 
@@ -476,7 +496,7 @@ jobs:
                       width: 96px;
                       height: 96px;
                       border-radius: 24px;
-                      object-fit: cover;
+                      box-fit: cover;
                       margin: 0 auto 20px auto;
                       box-shadow: 0px 2px 4px rgba(0,0,0,0.1);
                       display: block;
