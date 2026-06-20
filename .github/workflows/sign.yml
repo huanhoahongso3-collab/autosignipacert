@@ -17,6 +17,11 @@ on:
         description: 'Custom IPA Download URL (Only used if "Custom" is selected)'
         required: false
         default: ''
+      skip_signing:
+        type: boolean
+        description: 'Skip Signing (Bật nếu app đã được sign sẵn, chỉ cần tạo link cài đặt)'
+        required: false
+        default: false
       custom_p12_url:
         description: 'Custom P12 URL (Optional - leave blank to use local cert.p12)'
         required: false
@@ -105,6 +110,12 @@ jobs:
       - name: Install Apple Certificate & Extract Identity
         id: keychain_setup
         run: |
+          if [ "${{ github.event.inputs.skip_signing }}" = "true" ]; then
+            echo "cert_name=Pre-signed (Bỏ qua bước ký)" >> $GITHUB_OUTPUT
+            echo "⏭️ Skipping certificate setup because 'Skip Signing' is enabled."
+            exit 0
+          fi
+
           set +e
 
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
@@ -139,14 +150,14 @@ jobs:
           fi
 
           echo "📋 Verifying password and extracting Certificate Metadata..."
-          CERT_SUBJECT=$(openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin "pass:$P12_PASS" 2>&1)
+          box_subject=$(openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin "pass:$P12_PASS" 2>&1)
           if [ $? -ne 0 ]; then
              echo "❌ ERROR: OpenSSL MAC verification failed. The certificate password provided is incorrect."
-             echo "$CERT_SUBJECT"
+             echo "$box_subject"
              exit 1
           fi
 
-          CERT_CN=$(echo "$CERT_SUBJECT" | openssl x509 -noout -subject 2>/dev/null | grep -oE "CN\s*=\s*[^,/]+" | sed -E 's/^CN\s*=\s*//g' | tr -d '"' | xargs)
+          CERT_CN=$(echo "$box_subject" | openssl x509 -noout -subject 2>/dev/null | grep -oE "CN\s*=\s*[^,/]+" | sed -E 's/^CN\s*=\s*//g' | tr -d '"' | xargs)
           if [ -z "$CERT_CN" ]; then
              CERT_CN="Unknown Developer / Enterprise Certificate"
           fi
@@ -180,20 +191,26 @@ jobs:
           cp "$PROVISION_FILE" ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
           rm provision.plist
 
-      # 4. Unzip, Extract App Info, Query App Store API Database, and Resign
+      # 4. Unzip, Extract App Info, Query App Store API Database, and Resign (or Pack directly)
       - name: Extract App Details and Resign IPA
         id: resign_ipa
         run: |
           CLEAN_CHOICE=$(echo "${{ github.event.inputs.app_choice }}" | sed 's/ /_/g')
-          OUTPUT_NAME="${CLEAN_CHOICE}-Signed.ipa"
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
-
-          security list-keychains -s $KEYCHAIN_PATH $(security list-keychains | tr -d '"')
-          CERT_NAME=$(security find-identity -v -p codesigning $KEYCHAIN_PATH | grep -o '"[^"]*"' | head -n 1 | tr -d '"')
+          SKIP_SIGNING="${{ github.event.inputs.skip_signing }}"
           
-          if [ -z "$CERT_NAME" ]; then
-            echo "❌ Error: Could not find any valid code signing identities."
-            exit 1
+          if [ "$SKIP_SIGNING" = "true" ]; then
+            OUTPUT_NAME="${CLEAN_CHOICE}.ipa"
+            CERT_NAME="Pre-signed / Original"
+          else
+            OUTPUT_NAME="${CLEAN_CHOICE}-Signed.ipa"
+            KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+            security list-keychains -s $KEYCHAIN_PATH $(security list-keychains | tr -d '"')
+            CERT_NAME=$(security find-identity -v -p codesigning $KEYCHAIN_PATH | grep -o '"[^"]*"' | head -n 1 | tr -d '"')
+            
+            if [ -z "$CERT_NAME" ]; then
+              echo "❌ Error: Could not find any valid code signing identities."
+              exit 1
+            fi
           fi
 
           echo "📦 Unzipping IPA..."
@@ -293,7 +310,7 @@ jobs:
               fi
             done
 
-            # Fallback 2: Scan for standard AppIcon assets (Excludes UI texture/sprite configurations)
+            # Fallback 2: Scan for standard AppIcon assets
             if [ "$HAS_ICON" = "false" ]; then
               echo "⚠️ Fallback 2: Scanning for explicit AppIcon structural names by dimension..."
               IFS=$'\n'
@@ -323,28 +340,34 @@ jobs:
           echo "Final Icon Detection Status: $HAS_ICON"
           echo "has_icon=$HAS_ICON" >> $GITHUB_OUTPUT
 
-          # Codesigning steps
-          rm -rf "$APP_PATH/_CodeSignature"
-          cp cert.mobileprovision "$APP_PATH/embedded.mobileprovision"
+          # Codesigning steps (Chỉ chạy nếu KHÔNG chọn skip_signing)
+          if [ "$SKIP_SIGNING" != "true" ]; then
+            echo "⚡ Resigning application binaries..."
+            rm -rf "$APP_PATH/_CodeSignature"
+            cp cert.mobileprovision "$APP_PATH/embedded.mobileprovision"
 
-          security cms -D -i cert.mobileprovision > provision.plist
-          /usr/libexec/PlistBuddy -x -c "Print :Entitlements" provision.plist > entitlements.plist
+            security cms -D -i cert.mobileprovision > provision.plist
+            /usr/libexec/PlistBuddy -x -c "Print :Entitlements" provision.plist > entitlements.plist
 
-          if [ -d "$APP_PATH/Frameworks" ]; then
-            for framework in "$APP_PATH/Frameworks/"*; do
-              if [ -d "$framework" ] || [ -f "$framework" ]; then
-                codesign --force --sign "$CERT_NAME" --keychain $KEYCHAIN_PATH "$framework"
-              fi
-            done
+            if [ -d "$APP_PATH/Frameworks" ]; then
+              for framework in "$APP_PATH/Frameworks/"*; do
+                if [ -d "$framework" ] || [ -f "$framework" ]; then
+                  codesign --force --sign "$CERT_NAME" --keychain $KEYCHAIN_PATH "$framework"
+                fi
+              done
+            fi
+
+            codesign --force --sign "$CERT_NAME" --keychain $KEYCHAIN_PATH --entitlements entitlements.plist "$APP_PATH"
+            rm -f provision.plist entitlements.plist
+          else
+            echo "⏭️ Skipping codesign process. Keeping original signatures."
           fi
-
-          codesign --force --sign "$CERT_NAME" --keychain $KEYCHAIN_PATH --entitlements entitlements.plist "$APP_PATH"
 
           cd app_extracted
           zip -qr ../"$OUTPUT_NAME" Payload
           cd ..
 
-          rm -rf app_extracted provision.plist entitlements.plist
+          rm -rf app_extracted
           echo "output_ipa_name=$OUTPUT_NAME" >> $GITHUB_OUTPUT
 
       # 5. Create GitHub Release with metadata notes
