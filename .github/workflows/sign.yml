@@ -166,7 +166,7 @@ jobs:
 
           echo "🔄 Re-packaging certificate keys to ensure macOS Keychain compatibility..."
           openssl pkcs12 -in "$P12_FILE" -passin "pass:$P12_PASS" -nodes -out combined_temp.pem 2>/dev/null
-          openssl pkcs12 -export -in combined_temp.pem -out cert_clean.p12 -passout "pass:$P12_PASS" 2>/dev/null
+          openssl pkcs12 -export -in combined_temp.pem -out cert_clean.p12 -passout "pass:$P12_PASS" -legacy -provider legacy -provider default 2>/dev/null
           rm combined_temp.pem
 
           if [ ! -f "cert_clean.p12" ]; then
